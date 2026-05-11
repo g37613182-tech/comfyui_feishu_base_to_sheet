@@ -9,6 +9,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
+NODE_VERSION = "0.2.0"
+
+
 class FeishuAPIError(RuntimeError):
     pass
 
@@ -218,13 +221,13 @@ class FeishuOpenAPI:
                 raw = exc.read().decode("utf-8", errors="replace")
                 last_error = self._format_http_error(exc.code, raw)
                 if exc.code not in (429, 500, 502, 503, 504) or attempt == 2:
-                    raise FeishuAPIError(last_error) from exc
+                    raise FeishuAPIError(f"FeishuBaseToSheet v{NODE_VERSION}: {last_error}") from exc
                 time.sleep(0.8 * (attempt + 1))
                 continue
             except urllib.error.URLError as exc:
                 last_error = f"Network error while calling Feishu OpenAPI: {exc.reason}"
                 if attempt == 2:
-                    raise FeishuAPIError(last_error) from exc
+                    raise FeishuAPIError(f"FeishuBaseToSheet v{NODE_VERSION}: {last_error}") from exc
                 time.sleep(0.8 * (attempt + 1))
                 continue
 
@@ -232,10 +235,10 @@ class FeishuOpenAPI:
             code = payload.get("code", 0)
             if code != 0:
                 msg = payload.get("msg") or payload.get("message") or "Feishu OpenAPI returned an error"
-                raise FeishuAPIError(f"Feishu OpenAPI error code={code}: {msg}")
+                raise FeishuAPIError(f"FeishuBaseToSheet v{NODE_VERSION}: Feishu OpenAPI error code={code}: {msg}")
             return payload
 
-        raise FeishuAPIError(last_error or "Unknown Feishu OpenAPI error")
+        raise FeishuAPIError(f"FeishuBaseToSheet v{NODE_VERSION}: {last_error or 'Unknown Feishu OpenAPI error'}")
 
     @staticmethod
     def _format_http_error(code: int, raw: str) -> str:
@@ -473,6 +476,7 @@ class FeishuBaseToSheet:
         if not rows:
             status = {
                 "ok": True,
+                "version": NODE_VERSION,
                 "message": "No rows to write",
                 "records_read": len(records),
                 "rows_written": 0,
@@ -492,6 +496,7 @@ class FeishuBaseToSheet:
 
         status = {
             "ok": True,
+            "version": NODE_VERSION,
             "ranges": written_ranges,
             "mode": mode,
             "records_read": len(records),
@@ -505,8 +510,10 @@ class FeishuBaseToSheet:
 
 NODE_CLASS_MAPPINGS = {
     "FeishuBaseToSheet": FeishuBaseToSheet,
+    "FeishuBaseToSheetV020": FeishuBaseToSheet,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FeishuBaseToSheet": "Feishu Base To Sheet",
+    "FeishuBaseToSheet": "Feishu Base To Sheet v0.2.0",
+    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.2.0",
 }
