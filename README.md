@@ -73,3 +73,15 @@ BAResourceConvert(output_type=图片) -> Feishu Image To Sheet Cell v0.3.0(image
 - `image_name`：写入图片名称，例如 `attachment.png`。
 
 这个节点调用飞书 Sheet 的 `values_image` 接口，适合把 Base 附件下载后的图片写进 Sheet。非图片附件不能作为单元格图片写入，建议写文件名、JSON 或上传到云空间后写链接。
+
+## 统一写入文本或图片
+
+推荐使用 `Feishu Value To Sheet Cell v0.4.0`。它可以按行列写入文本或图片：
+
+- `row`：目标行号，从 1 开始。
+- `column`：目标列，支持 `C` 或 `3`，二者都会定位到 C 列。
+- `mode`：`auto` / `text` / `image`。
+- `text`：文本输入。
+- `image`：ComfyUI `IMAGE` 输入。
+
+`auto` 模式下，如果连接了 `image` 输入就写图片；否则写 `text`。写图片时仍然调用飞书 Sheet 的 `values_image` 接口，写文本时调用普通单元格写入接口。

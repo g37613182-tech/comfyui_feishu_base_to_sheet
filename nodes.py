@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-NODE_VERSION = "0.3.0"
+NODE_VERSION = "0.4.0"
 
 
 class FeishuAPIError(RuntimeError):
@@ -91,6 +91,24 @@ def _number_to_col(number: int) -> str:
         number, rem = divmod(number - 1, 26)
         chars.append(chr(ord("A") + rem))
     return "".join(reversed(chars))
+
+
+def _column_to_letter(column: Any) -> str:
+    column = _clean_text_input(str(column))
+    if not column:
+        raise ValueError("column is required")
+    if column.isdigit():
+        return _number_to_col(int(column))
+    if re.fullmatch(r"[A-Za-z]+", column):
+        return column.upper()
+    raise ValueError("column must be a letter like C or a 1-based number like 3")
+
+
+def _cell_from_row_column(row: int, column: Any) -> str:
+    row = int(row)
+    if row < 1:
+        raise ValueError("row must be >= 1")
+    return f"{_column_to_letter(column)}{row}"
 
 
 def _parse_cell(cell: str) -> Tuple[int, int]:
@@ -639,14 +657,117 @@ class FeishuImageToSheetCell:
         return (_json_dumps(status),)
 
 
+class FeishuValueToSheetCell:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "app_id": ("STRING", {"default": ""}),
+                "app_secret": ("STRING", {"default": ""}),
+                "spreadsheet_url_or_token": ("STRING", {"default": ""}),
+                "sheet_id": ("STRING", {"default": ""}),
+                "row": ("INT", {"default": 1, "min": 1, "max": 1000000, "step": 1}),
+                "column": ("STRING", {"default": "A"}),
+                "mode": (["auto", "text", "image"], {"default": "auto"}),
+                "image_name": ("STRING", {"default": "image.png"}),
+                "timeout_seconds": ("INT", {"default": 30, "min": 5, "max": 300, "step": 1}),
+            },
+            "optional": {
+                "text": ("STRING", {"default": "", "multiline": True}),
+                "image": ("IMAGE",),
+                "openapi_domain": ("STRING", {"default": "https://open.feishu.cn"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("status_json",)
+    FUNCTION = "write_value"
+    CATEGORY = "Feishu"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return time.time()
+
+    def write_value(
+        self,
+        app_id: str,
+        app_secret: str,
+        spreadsheet_url_or_token: str,
+        sheet_id: str,
+        row: int,
+        column: str,
+        mode: str,
+        image_name: str,
+        timeout_seconds: int,
+        text: str = "",
+        image: Any = None,
+        openapi_domain: str = "https://open.feishu.cn",
+    ) -> Tuple[str]:
+        app_id = _read_secret(app_id, "FEISHU_APP_ID")
+        app_secret = _read_secret(app_secret, "FEISHU_APP_SECRET")
+        spreadsheet_url_or_token = _clean_text_input(spreadsheet_url_or_token)
+        sheet_id = _clean_text_input(sheet_id)
+        cell = _cell_from_row_column(row, column)
+        image_name = _clean_text_input(image_name) or "image.png"
+        text = "" if text is None else str(text)
+        openapi_domain = _clean_text_input(openapi_domain) or "https://open.feishu.cn"
+        if not app_id or not app_secret:
+            raise ValueError("app_id/app_secret are required, or set FEISHU_APP_ID and FEISHU_APP_SECRET")
+
+        spreadsheet_token = _extract_token(spreadsheet_url_or_token, [r"/sheets/([^/?#]+)"])
+        sheet_id = (sheet_id or _first_query_value(spreadsheet_url_or_token, ["sheet", "sheet_id"])).strip()
+        if not spreadsheet_token:
+            raise ValueError("spreadsheet_url_or_token must be a Sheet URL or spreadsheet token")
+        if not sheet_id:
+            raise ValueError("sheet_id is required, or pass a Sheet URL containing ?sheet=xxxx")
+
+        api = FeishuOpenAPI(openapi_domain, timeout_seconds)
+        access_token = api.tenant_access_token(app_id, app_secret)
+        cell_range = _make_range(sheet_id, cell, 1, 1)
+
+        if mode == "image" or (mode == "auto" and image is not None):
+            if image is None:
+                raise ValueError("mode=image requires an IMAGE input")
+            image_bytes = _image_to_png_bytes(image)
+            write_result = api.write_image(access_token, spreadsheet_token, cell_range, image_bytes, image_name)
+            status = {
+                "ok": True,
+                "version": NODE_VERSION,
+                "write_type": "image",
+                "range": cell_range,
+                "row": int(row),
+                "column": _column_to_letter(column),
+                "image_name": image_name,
+                "image_bytes": len(image_bytes),
+                "feishu_response": write_result,
+            }
+            return (_json_dumps(status),)
+
+        write_result = api.write_values(access_token, spreadsheet_token, cell_range, [[text]], "overwrite")
+        status = {
+            "ok": True,
+            "version": NODE_VERSION,
+            "write_type": "text",
+            "range": cell_range,
+            "row": int(row),
+            "column": _column_to_letter(column),
+            "text_length": len(text),
+            "feishu_response": write_result,
+        }
+        return (_json_dumps(status),)
+
+
 NODE_CLASS_MAPPINGS = {
     "FeishuBaseToSheet": FeishuBaseToSheet,
     "FeishuBaseToSheetV020": FeishuBaseToSheet,
     "FeishuImageToSheetCell": FeishuImageToSheetCell,
+    "FeishuValueToSheetCell": FeishuValueToSheetCell,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FeishuBaseToSheet": "Feishu Base To Sheet v0.3.0",
-    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.3.0",
-    "FeishuImageToSheetCell": "Feishu Image To Sheet Cell v0.3.0",
+    "FeishuBaseToSheet": "Feishu Base To Sheet v0.4.0",
+    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.4.0",
+    "FeishuImageToSheetCell": "Feishu Image To Sheet Cell v0.4.0",
+    "FeishuValueToSheetCell": "Feishu Value To Sheet Cell v0.4.0",
 }
