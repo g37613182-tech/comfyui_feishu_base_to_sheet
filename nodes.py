@@ -975,21 +975,27 @@ class FeishuSheetCellReader:
                             break
 
         if file_tokens:
-            image_bytes = api.download_media(access_token, file_tokens[0])
-            image = _image_bytes_to_comfy_image(image_bytes)
-            status = {
-                "ok": True,
-                "version": NODE_VERSION,
-                "read_type": "image",
-                "image_source": image_source,
-                "range": cell_range,
-                "row": int(row),
-                "column": _column_to_letter(column),
-                "file_token": file_tokens[0],
-                "image_bytes": len(image_bytes),
-                "raw_cell": value,
-            }
-            return text, image, _json_dumps(status), True
+            try:
+                image_bytes = api.download_media(access_token, file_tokens[0])
+            except FeishuAPIError as exc:
+                image_lookup_error = str(exc)
+                if read_mode == "image":
+                    raise
+            else:
+                image = _image_bytes_to_comfy_image(image_bytes)
+                status = {
+                    "ok": True,
+                    "version": NODE_VERSION,
+                    "read_type": "image",
+                    "image_source": image_source,
+                    "range": cell_range,
+                    "row": int(row),
+                    "column": _column_to_letter(column),
+                    "file_token": file_tokens[0],
+                    "image_bytes": len(image_bytes),
+                    "raw_cell": value,
+                }
+                return text, image, _json_dumps(status), True
 
         if read_mode == "image":
             raise ValueError("No image token was found in the target Sheet cell. Try read_mode=text to inspect status_json/raw_cell.")
