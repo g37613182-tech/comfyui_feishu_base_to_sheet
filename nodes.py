@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-NODE_VERSION = "0.4.0"
+NODE_VERSION = "0.5.0"
 
 
 class FeishuAPIError(RuntimeError):
@@ -237,6 +237,71 @@ def _image_to_png_bytes(image: Any) -> bytes:
     return buffer.getvalue()
 
 
+def _image_bytes_to_comfy_image(image_bytes: bytes) -> Any:
+    from PIL import Image
+    import numpy as np
+    import torch
+
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    array = np.asarray(image).astype(np.float32) / 255.0
+    return torch.from_numpy(array)[None,]
+
+
+def _blank_comfy_image() -> Any:
+    import torch
+
+    return torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+
+
+def _cell_value_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return _json_dumps(value)
+
+
+def _extract_file_tokens(value: Any) -> List[str]:
+    tokens: List[str] = []
+
+    def add_token(raw: Any) -> None:
+        if not isinstance(raw, str):
+            return
+        for token in re.findall(r"box[a-zA-Z0-9_-]+", raw):
+            if token not in tokens:
+                tokens.append(token)
+
+    def walk(item: Any) -> None:
+        if isinstance(item, dict):
+            for key in ("file_token", "fileToken", "token", "text"):
+                add_token(item.get(key))
+            for value in item.values():
+                walk(value)
+        elif isinstance(item, list):
+            for value in item:
+                walk(value)
+        else:
+            add_token(item)
+
+    walk(value)
+    return tokens
+
+
+def _range_anchor_cell(cell_range: Any) -> str:
+    if not isinstance(cell_range, str):
+        return ""
+    ref = cell_range.split("!", 1)[-1]
+    return ref.split(":", 1)[0].replace("$", "").upper()
+
+
+def _range_sheet_id(cell_range: Any) -> str:
+    if not isinstance(cell_range, str) or "!" not in cell_range:
+        return ""
+    return cell_range.split("!", 1)[0]
+
+
 class FeishuOpenAPI:
     def __init__(self, domain: str, timeout: int) -> None:
         self.domain = (domain or "https://open.feishu.cn").rstrip("/")
@@ -291,6 +356,32 @@ class FeishuOpenAPI:
             return payload
 
         raise FeishuAPIError(f"FeishuBaseToSheet v{NODE_VERSION}: {last_error or 'Unknown Feishu OpenAPI error'}")
+
+    def request_bytes(
+        self,
+        method: str,
+        path: str,
+        token: Optional[str] = None,
+        query: Optional[Dict[str, Any]] = None,
+    ) -> bytes:
+        query = {key: value for key, value in (query or {}).items() if value not in (None, "")}
+        url = f"{self.domain}{path}"
+        if query:
+            url = f"{url}?{urllib.parse.urlencode(query)}"
+
+        headers = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        req = urllib.request.Request(url, headers=headers, method=method.upper())
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            raise FeishuAPIError(f"FeishuBaseToSheet v{NODE_VERSION}: {self._format_http_error(exc.code, raw)}") from exc
+        except urllib.error.URLError as exc:
+            raise FeishuAPIError(f"FeishuBaseToSheet v{NODE_VERSION}: Network error while calling Feishu OpenAPI: {exc.reason}") from exc
 
     @staticmethod
     def _format_http_error(code: int, raw: str) -> str:
@@ -394,6 +485,43 @@ class FeishuOpenAPI:
                 body={"valueRanges": [{"range": cell_range, "values": values}]},
             )
         return payload.get("data", {})
+
+    def read_values(
+        self,
+        token: str,
+        spreadsheet_token: str,
+        cell_range: str,
+        date_time_render_option: str,
+    ) -> Dict[str, Any]:
+        spreadsheet_token = urllib.parse.quote(spreadsheet_token, safe="")
+        encoded_range = urllib.parse.quote(cell_range, safe="")
+        payload = self.request(
+            "GET",
+            f"/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values/{encoded_range}",
+            token=token,
+            query={
+                "dateTimeRenderOption": date_time_render_option,
+                "user_id_type": "open_id",
+            },
+        )
+        return payload.get("data", {})
+
+    def query_float_images(self, token: str, spreadsheet_token: str, sheet_id: str) -> List[Dict[str, Any]]:
+        spreadsheet_token = urllib.parse.quote(spreadsheet_token, safe="")
+        sheet_id = urllib.parse.quote(sheet_id, safe="")
+        payload = self.request(
+            "GET",
+            f"/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/{sheet_id}/float_images/query",
+            token=token,
+        )
+        return payload.get("data", {}).get("items", [])
+
+    def download_media(self, token: str, file_token: str) -> bytes:
+        return self.request_bytes(
+            "GET",
+            f"/open-apis/drive/v1/medias/{urllib.parse.quote(file_token, safe='')}/download",
+            token=token,
+        )
 
     def write_image(
         self,
@@ -758,16 +886,139 @@ class FeishuValueToSheetCell:
         return (_json_dumps(status),)
 
 
+class FeishuSheetCellReader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "app_id": ("STRING", {"default": ""}),
+                "app_secret": ("STRING", {"default": ""}),
+                "spreadsheet_url_or_token": ("STRING", {"default": ""}),
+                "sheet_id": ("STRING", {"default": ""}),
+                "row": ("INT", {"default": 1, "min": 1, "max": 1000000, "step": 1}),
+                "column": ("STRING", {"default": "A"}),
+                "read_mode": (["auto", "text", "image"], {"default": "auto"}),
+                "date_time_render_option": (["FormattedString", "SerialNumber"], {"default": "FormattedString"}),
+                "timeout_seconds": ("INT", {"default": 30, "min": 5, "max": 300, "step": 1}),
+            },
+            "optional": {
+                "openapi_domain": ("STRING", {"default": "https://open.feishu.cn"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "BOOLEAN")
+    RETURN_NAMES = ("text", "image", "status_json", "has_image")
+    FUNCTION = "read_cell"
+    CATEGORY = "Feishu"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return time.time()
+
+    def read_cell(
+        self,
+        app_id: str,
+        app_secret: str,
+        spreadsheet_url_or_token: str,
+        sheet_id: str,
+        row: int,
+        column: str,
+        read_mode: str,
+        date_time_render_option: str,
+        timeout_seconds: int,
+        openapi_domain: str = "https://open.feishu.cn",
+    ) -> Tuple[str, Any, str, bool]:
+        app_id = _read_secret(app_id, "FEISHU_APP_ID")
+        app_secret = _read_secret(app_secret, "FEISHU_APP_SECRET")
+        spreadsheet_url_or_token = _clean_text_input(spreadsheet_url_or_token)
+        sheet_id = _clean_text_input(sheet_id)
+        openapi_domain = _clean_text_input(openapi_domain) or "https://open.feishu.cn"
+        if not app_id or not app_secret:
+            raise ValueError("app_id/app_secret are required, or set FEISHU_APP_ID and FEISHU_APP_SECRET")
+
+        spreadsheet_token = _extract_token(spreadsheet_url_or_token, [r"/sheets/([^/?#]+)"])
+        sheet_id = (sheet_id or _first_query_value(spreadsheet_url_or_token, ["sheet", "sheet_id"])).strip()
+        if not spreadsheet_token:
+            raise ValueError("spreadsheet_url_or_token must be a Sheet URL or spreadsheet token")
+        if not sheet_id:
+            raise ValueError("sheet_id is required, or pass a Sheet URL containing ?sheet=xxxx")
+
+        cell = _cell_from_row_column(row, column)
+        cell_range = _make_range(sheet_id, cell, 1, 1)
+        api = FeishuOpenAPI(openapi_domain, timeout_seconds)
+        access_token = api.tenant_access_token(app_id, app_secret)
+
+        data = api.read_values(access_token, spreadsheet_token, cell_range, date_time_render_option)
+        values = data.get("valueRange", {}).get("values", [[]])
+        value = values[0][0] if values and values[0] else ""
+        text = _cell_value_to_text(value)
+
+        file_tokens = _extract_file_tokens(value) if read_mode in ("auto", "image") else []
+        image_lookup_error = ""
+        image_source = "cell_value_token"
+        if read_mode in ("auto", "image") and not file_tokens:
+            try:
+                float_images = api.query_float_images(access_token, spreadsheet_token, sheet_id)
+            except FeishuAPIError as exc:
+                image_lookup_error = str(exc)
+                if read_mode == "image":
+                    raise
+            else:
+                for item in float_images:
+                    item_range = item.get("range")
+                    if _range_sheet_id(item_range) in ("", sheet_id) and _range_anchor_cell(item_range) == cell.upper():
+                        token = item.get("float_image_token")
+                        if token:
+                            file_tokens = [token]
+                            image_source = "float_image"
+                            break
+
+        if file_tokens:
+            image_bytes = api.download_media(access_token, file_tokens[0])
+            image = _image_bytes_to_comfy_image(image_bytes)
+            status = {
+                "ok": True,
+                "version": NODE_VERSION,
+                "read_type": "image",
+                "image_source": image_source,
+                "range": cell_range,
+                "row": int(row),
+                "column": _column_to_letter(column),
+                "file_token": file_tokens[0],
+                "image_bytes": len(image_bytes),
+                "raw_cell": value,
+            }
+            return text, image, _json_dumps(status), True
+
+        if read_mode == "image":
+            raise ValueError("No image token was found in the target Sheet cell. Try read_mode=text to inspect status_json/raw_cell.")
+
+        status = {
+            "ok": True,
+            "version": NODE_VERSION,
+            "read_type": "text",
+            "range": cell_range,
+            "row": int(row),
+            "column": _column_to_letter(column),
+            "image_lookup_error": image_lookup_error,
+            "raw_cell": value,
+        }
+        return text, _blank_comfy_image(), _json_dumps(status), False
+
+
 NODE_CLASS_MAPPINGS = {
     "FeishuBaseToSheet": FeishuBaseToSheet,
     "FeishuBaseToSheetV020": FeishuBaseToSheet,
     "FeishuImageToSheetCell": FeishuImageToSheetCell,
     "FeishuValueToSheetCell": FeishuValueToSheetCell,
+    "FeishuSheetCellReader": FeishuSheetCellReader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FeishuBaseToSheet": "Feishu Base To Sheet v0.4.0",
-    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.4.0",
-    "FeishuImageToSheetCell": "Feishu Image To Sheet Cell v0.4.0",
-    "FeishuValueToSheetCell": "Feishu Value To Sheet Cell v0.4.0",
+    "FeishuBaseToSheet": "Feishu Base To Sheet v0.5.0",
+    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.5.0",
+    "FeishuImageToSheetCell": "Feishu Image To Sheet Cell v0.5.0",
+    "FeishuValueToSheetCell": "Feishu Value To Sheet Cell v0.5.0",
+    "FeishuSheetCellReader": "Feishu Sheet Cell Reader v0.5.0",
 }

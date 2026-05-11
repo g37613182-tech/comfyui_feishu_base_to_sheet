@@ -12,7 +12,7 @@ ComfyUI/custom_nodes/comfyui_feishu_base_to_sheet
 
 然后重启 ComfyUI。节点会出现在 `Feishu` 分类下，显示名为 `Feishu Base To Sheet`。
 
-本节点只使用 Python 标准库，不需要额外安装依赖。
+OpenAPI 请求只使用 Python 标准库；图片输入/输出会使用 ComfyUI 环境里通常自带的 `PIL`、`numpy` 和 `torch`。
 
 ## 飞书权限
 
@@ -57,12 +57,12 @@ $env:FEISHU_APP_SECRET="xxx"
 
 ## 写入图片到 Sheet 单元格
 
-`Feishu Image To Sheet Cell v0.3.0` 可以把 ComfyUI 的 `IMAGE` 写入普通飞书 Sheet 的单个单元格。
+`Feishu Image To Sheet Cell v0.5.0` 可以把 ComfyUI 的 `IMAGE` 写入普通飞书 Sheet 的单个单元格。
 
 典型连接方式：
 
 ```text
-BAResourceConvert(output_type=图片) -> Feishu Image To Sheet Cell v0.3.0(image)
+BAResourceConvert(output_type=图片) -> Feishu Image To Sheet Cell v0.5.0(image)
 ```
 
 关键参数：
@@ -76,7 +76,7 @@ BAResourceConvert(output_type=图片) -> Feishu Image To Sheet Cell v0.3.0(image
 
 ## 统一写入文本或图片
 
-推荐使用 `Feishu Value To Sheet Cell v0.4.0`。它可以按行列写入文本或图片：
+推荐使用 `Feishu Value To Sheet Cell v0.5.0`。它可以按行列写入文本或图片：
 
 - `row`：目标行号，从 1 开始。
 - `column`：目标列，支持 `C` 或 `3`，二者都会定位到 C 列。
@@ -85,3 +85,23 @@ BAResourceConvert(output_type=图片) -> Feishu Image To Sheet Cell v0.3.0(image
 - `image`：ComfyUI `IMAGE` 输入。
 
 `auto` 模式下，如果连接了 `image` 输入就写图片；否则写 `text`。写图片时仍然调用飞书 Sheet 的 `values_image` 接口，写文本时调用普通单元格写入接口。
+
+## 读取 Sheet 单元格文本或图片
+
+使用 `Feishu Sheet Cell Reader v0.5.0` 从普通飞书 Sheet 的指定单元格读取内容：
+
+- `spreadsheet_url_or_token`：飞书普通表格 URL 或 spreadsheet token。
+- `sheet_id`：工作表 ID；如果 URL 带 `?sheet=xxxx` 可以留空。
+- `row`：目标行号，从 1 开始。
+- `column`：目标列，支持 `C` 或 `3`。
+- `read_mode`：`auto` / `text` / `image`。
+- `date_time_render_option`：日期时间返回格式，默认 `FormattedString`。
+
+输出包含：
+
+- `text`：单元格文本；如果单元格返回的是复杂 JSON，会转成 JSON 字符串。
+- `image`：ComfyUI `IMAGE`；没有图片时返回 1x1 空图。
+- `status_json`：读取范围、版本、原始返回值、图片 token 等诊断信息。
+- `has_image`：是否成功读到图片。
+
+图片读取会优先识别单元格返回值中的 `box...` 素材 token，并额外查询同一单元格上的浮动图片。飞书普通表格的“单元格图片”接口不一定会在普通读取接口里暴露图片 token；如果 `has_image=false`，请先看 `status_json.raw_cell`，再决定是否需要继续适配另一种图片形态。
