@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
 
-NODE_VERSION = "0.6.0"
+NODE_VERSION = "0.7.0"
 
 
 class FeishuAPIError(RuntimeError):
@@ -245,7 +245,14 @@ def _image_bytes_to_comfy_image(image_bytes: bytes) -> Any:
     import numpy as np
     import torch
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image = Image.open(io.BytesIO(image_bytes))
+    if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+        rgba = image.convert("RGBA")
+        background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        background.alpha_composite(rgba)
+        image = background.convert("RGB")
+    else:
+        image = image.convert("RGB")
     array = np.asarray(image).astype(np.float32) / 255.0
     return torch.from_numpy(array)[None,]
 
@@ -269,17 +276,21 @@ def _cell_value_to_text(value: Any) -> str:
 def _extract_file_tokens(value: Any) -> List[str]:
     tokens: List[str] = []
 
-    def add_token(raw: Any) -> None:
+    def add_token(raw: Any, allow_plain: bool = False) -> None:
         if not isinstance(raw, str):
             return
         for token in re.findall(r"box[a-zA-Z0-9_-]+", raw):
             if token not in tokens:
                 tokens.append(token)
+        plain = raw.strip()
+        if allow_plain and re.fullmatch(r"[A-Za-z0-9_-]{8,}", plain) and plain not in tokens:
+            tokens.append(plain)
 
     def walk(item: Any) -> None:
         if isinstance(item, dict):
-            for key in ("file_token", "fileToken", "token", "text"):
-                add_token(item.get(key))
+            for key in ("file_token", "fileToken", "imageToken", "float_image_token", "token"):
+                add_token(item.get(key), allow_plain=True)
+            add_token(item.get("text"))
             for value in item.values():
                 walk(value)
         elif isinstance(item, list):
@@ -290,6 +301,17 @@ def _extract_file_tokens(value: Any) -> List[str]:
 
     walk(value)
     return tokens
+
+
+def _looks_like_sheet_image_value(value: Any) -> bool:
+    if isinstance(value, dict):
+        keys = {str(key).lower() for key in value.keys()}
+        if keys & {"filetoken", "file_token", "imagetoken", "float_image_token"}:
+            return True
+        return any(_looks_like_sheet_image_value(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_looks_like_sheet_image_value(item) for item in value)
+    return False
 
 
 def _range_anchor_cell(cell_range: Any) -> str:
@@ -1163,6 +1185,7 @@ class FeishuSheetCellReader:
         value = values[0][0] if values and values[0] else ""
         text = _cell_value_to_text(value)
 
+        image_like_value = _looks_like_sheet_image_value(value)
         file_tokens = _extract_file_tokens(value) if read_mode in ("auto", "image") else []
         image_lookup_error = ""
         image_source = "cell_value_token"
@@ -1184,10 +1207,10 @@ class FeishuSheetCellReader:
         if file_tokens:
             try:
                 image_bytes = api.download_media(access_token, file_tokens[0])
-            except FeishuAPIError as exc:
+                image = _image_bytes_to_comfy_image(image_bytes)
+            except Exception as exc:
                 image_lookup_error = str(exc)
             else:
-                image = _image_bytes_to_comfy_image(image_bytes)
                 status = {
                     "ok": True,
                     "version": NODE_VERSION,
@@ -1202,15 +1225,23 @@ class FeishuSheetCellReader:
                 }
                 return text, image, _json_dumps(status), True
 
-        if read_mode == "image":
-            metainfo = api.sheet_metainfo(access_token, spreadsheet_token)
-            sheet_index, sheet_info = _sheet_index_from_metainfo(metainfo, sheet_id)
-            xlsx_bytes, export_status = api.export_spreadsheet_xlsx(
-                access_token,
-                spreadsheet_token,
-                timeout_seconds,
-            )
-            image_bytes, xlsx_details = _xlsx_extract_cell_image(xlsx_bytes, sheet_index, cell)
+        should_try_xlsx = read_mode == "image" or (read_mode == "auto" and image_like_value)
+        if should_try_xlsx:
+            export_status: Dict[str, Any] = {}
+            xlsx_details: Dict[str, Any] = {}
+            sheet_info: Dict[str, Any] = {}
+            try:
+                metainfo = api.sheet_metainfo(access_token, spreadsheet_token)
+                sheet_index, sheet_info = _sheet_index_from_metainfo(metainfo, sheet_id)
+                xlsx_bytes, export_status = api.export_spreadsheet_xlsx(
+                    access_token,
+                    spreadsheet_token,
+                    timeout_seconds,
+                )
+                image_bytes, xlsx_details = _xlsx_extract_cell_image(xlsx_bytes, sheet_index, cell)
+            except FeishuAPIError as exc:
+                image_lookup_error = f"{image_lookup_error}; {exc}" if image_lookup_error else str(exc)
+                image_bytes = None
             if image_bytes:
                 image = _image_bytes_to_comfy_image(image_bytes)
                 status = {
@@ -1236,6 +1267,7 @@ class FeishuSheetCellReader:
                 "row": int(row),
                 "column": _column_to_letter(column),
                 "raw_cell": value,
+                "image_like_value": image_like_value,
                 "image_lookup_error": image_lookup_error,
                 "export": export_status,
                 "xlsx": xlsx_details,
@@ -1250,6 +1282,7 @@ class FeishuSheetCellReader:
             "range": cell_range,
             "row": int(row),
             "column": _column_to_letter(column),
+            "image_like_value": image_like_value,
             "image_lookup_error": image_lookup_error,
             "raw_cell": value,
         }
@@ -1265,9 +1298,9 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FeishuBaseToSheet": "Feishu Base To Sheet v0.6.0",
-    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.6.0",
-    "FeishuImageToSheetCell": "Feishu Image To Sheet Cell v0.6.0",
-    "FeishuValueToSheetCell": "Feishu Value To Sheet Cell v0.6.0",
-    "FeishuSheetCellReader": "Feishu Sheet Cell Reader v0.6.0",
+    "FeishuBaseToSheet": "Feishu Base To Sheet v0.7.0",
+    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.7.0",
+    "FeishuImageToSheetCell": "Feishu Image To Sheet Cell v0.7.0",
+    "FeishuValueToSheetCell": "Feishu Value To Sheet Cell v0.7.0",
+    "FeishuSheetCellReader": "Feishu Sheet Cell Reader v0.7.0",
 }

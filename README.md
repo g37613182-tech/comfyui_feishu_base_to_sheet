@@ -57,12 +57,12 @@ $env:FEISHU_APP_SECRET="xxx"
 
 ## 写入图片到 Sheet 单元格
 
-`Feishu Image To Sheet Cell v0.6.0` 可以把 ComfyUI 的 `IMAGE` 写入普通飞书 Sheet 的单个单元格。
+`Feishu Image To Sheet Cell v0.7.0` 可以把 ComfyUI 的 `IMAGE` 写入普通飞书 Sheet 的单个单元格。
 
 典型连接方式：
 
 ```text
-BAResourceConvert(output_type=图片) -> Feishu Image To Sheet Cell v0.6.0(image)
+BAResourceConvert(output_type=图片) -> Feishu Image To Sheet Cell v0.7.0(image)
 ```
 
 关键参数：
@@ -76,7 +76,7 @@ BAResourceConvert(output_type=图片) -> Feishu Image To Sheet Cell v0.6.0(image
 
 ## 统一写入文本或图片
 
-推荐使用 `Feishu Value To Sheet Cell v0.6.0`。它可以按行列写入文本或图片：
+推荐使用 `Feishu Value To Sheet Cell v0.7.0`。它可以按行列写入文本或图片：
 
 - `row`：目标行号，从 1 开始。
 - `column`：目标列，支持 `C` 或 `3`，二者都会定位到 C 列。
@@ -88,7 +88,7 @@ BAResourceConvert(output_type=图片) -> Feishu Image To Sheet Cell v0.6.0(image
 
 ## 读取 Sheet 单元格文本或图片
 
-使用 `Feishu Sheet Cell Reader v0.6.0` 从普通飞书 Sheet 的指定单元格读取内容：
+使用 `Feishu Sheet Cell Reader v0.7.0` 从普通飞书 Sheet 的指定单元格读取内容：
 
 - `spreadsheet_url_or_token`：飞书普通表格 URL 或 spreadsheet token。
 - `sheet_id`：工作表 ID；如果 URL 带 `?sheet=xxxx` 可以留空。
@@ -104,4 +104,4 @@ BAResourceConvert(output_type=图片) -> Feishu Image To Sheet Cell v0.6.0(image
 - `status_json`：读取范围、版本、原始返回值、图片 token 等诊断信息。
 - `has_image`：是否成功读到图片。
 
-图片读取会优先识别单元格返回值中的 `box...` 素材 token，并额外查询同一单元格上的浮动图片。若 `read_mode=image` 仍然找不到 token，节点会自动把表格导出为 XLSX，并从 Excel 内嵌图片锚点中提取目标单元格图片。这个回退路径会稍慢，并需要应用有电子表格导出/下载相关权限；如果仍找不到图片，节点会返回空图和 `has_image=false`，同时把候选图片锚点写进 `status_json` 方便诊断。
+图片读取会优先识别单元格返回值中的 `box...` 或 `fileToken` 素材 token，并额外查询同一单元格上的浮动图片。若 `auto` 模式读到单元格图片结构但直接下载失败，或 `read_mode=image` 找不到可直接下载的 token，节点会自动把表格导出为 XLSX，并从 Excel 内嵌图片锚点中提取目标单元格图片。这个回退路径会稍慢，并需要应用有电子表格导出/下载相关权限；如果仍找不到图片，节点会返回空图和 `has_image=false`，同时把候选图片锚点写进 `status_json` 方便诊断。
