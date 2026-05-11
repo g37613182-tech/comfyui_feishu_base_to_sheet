@@ -1,16 +1,19 @@
 import json
 import io
 import os
+import posixpath
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from xml.etree import ElementTree as ET
 
 
-NODE_VERSION = "0.5.0"
+NODE_VERSION = "0.6.0"
 
 
 class FeishuAPIError(RuntimeError):
@@ -302,6 +305,154 @@ def _range_sheet_id(cell_range: Any) -> str:
     return cell_range.split("!", 1)[0]
 
 
+def _zip_join(base_path: str, target: str) -> str:
+    target = (target or "").replace("\\", "/")
+    if target.startswith("/"):
+        return target.lstrip("/")
+    return posixpath.normpath(posixpath.join(posixpath.dirname(base_path), target))
+
+
+def _relationship_targets(zf: zipfile.ZipFile, rels_path: str) -> Dict[str, str]:
+    if rels_path not in zf.namelist():
+        return {}
+    root = ET.fromstring(zf.read(rels_path))
+    targets: Dict[str, str] = {}
+    for rel in root:
+        if rel.tag.rsplit("}", 1)[-1] == "Relationship":
+            rel_id = rel.attrib.get("Id")
+            target = rel.attrib.get("Target")
+            if rel_id and target:
+                targets[rel_id] = target
+    return targets
+
+
+def _first_child_text(parent: ET.Element, local_name: str) -> Optional[str]:
+    for child in parent:
+        if child.tag.rsplit("}", 1)[-1] == local_name:
+            return child.text
+    return None
+
+
+def _first_descendant(element: ET.Element, local_name: str) -> Optional[ET.Element]:
+    for child in element.iter():
+        if child.tag.rsplit("}", 1)[-1] == local_name:
+            return child
+    return None
+
+
+def _xlsx_extract_cell_image(xlsx_bytes: bytes, sheet_index: int, cell: str) -> Tuple[Optional[bytes], Dict[str, Any]]:
+    rel_id_attr = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    embed_attr = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+    target_col, target_row = _parse_cell(cell)
+    target_col -= 1
+    target_row -= 1
+    details: Dict[str, Any] = {
+        "xlsx_sheet_index": sheet_index,
+        "target_cell": f"{_number_to_col(target_col + 1)}{target_row + 1}",
+        "candidate_cells": [],
+    }
+
+    with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as zf:
+        workbook_path = "xl/workbook.xml"
+        if workbook_path not in zf.namelist():
+            details["error"] = "xl/workbook.xml not found in exported XLSX"
+            return None, details
+
+        workbook_root = ET.fromstring(zf.read(workbook_path))
+        workbook_sheets = [
+            item for item in workbook_root.iter() if item.tag.rsplit("}", 1)[-1] == "sheet"
+        ]
+        if not workbook_sheets:
+            details["error"] = "No worksheets found in exported XLSX"
+            return None, details
+
+        sheet_index = max(0, min(int(sheet_index or 0), len(workbook_sheets) - 1))
+        sheet_el = workbook_sheets[sheet_index]
+        details["xlsx_sheet_name"] = sheet_el.attrib.get("name", "")
+        workbook_rels = _relationship_targets(zf, "xl/_rels/workbook.xml.rels")
+        worksheet_target = workbook_rels.get(sheet_el.attrib.get(rel_id_attr, ""))
+        if not worksheet_target:
+            details["error"] = "Worksheet relationship not found in exported XLSX"
+            return None, details
+
+        worksheet_path = _zip_join(workbook_path, worksheet_target)
+        details["worksheet_path"] = worksheet_path
+        if worksheet_path not in zf.namelist():
+            details["error"] = f"Worksheet file not found: {worksheet_path}"
+            return None, details
+
+        worksheet_root = ET.fromstring(zf.read(worksheet_path))
+        worksheet_rels_path = (
+            f"{posixpath.dirname(worksheet_path)}/_rels/{posixpath.basename(worksheet_path)}.rels"
+        )
+        worksheet_rels = _relationship_targets(zf, worksheet_rels_path)
+        drawing_paths: List[str] = []
+        for drawing in worksheet_root.iter():
+            if drawing.tag.rsplit("}", 1)[-1] != "drawing":
+                continue
+            drawing_target = worksheet_rels.get(drawing.attrib.get(rel_id_attr, ""))
+            if drawing_target:
+                drawing_paths.append(_zip_join(worksheet_path, drawing_target))
+        details["drawing_paths"] = drawing_paths
+
+        for drawing_path in drawing_paths:
+            if drawing_path not in zf.namelist():
+                continue
+            drawing_root = ET.fromstring(zf.read(drawing_path))
+            drawing_rels_path = (
+                f"{posixpath.dirname(drawing_path)}/_rels/{posixpath.basename(drawing_path)}.rels"
+            )
+            drawing_rels = _relationship_targets(zf, drawing_rels_path)
+
+            for anchor in drawing_root:
+                local = anchor.tag.rsplit("}", 1)[-1]
+                if local not in ("oneCellAnchor", "twoCellAnchor"):
+                    continue
+                from_el = None
+                for child in anchor:
+                    if child.tag.rsplit("}", 1)[-1] == "from":
+                        from_el = child
+                        break
+                if from_el is None:
+                    continue
+
+                try:
+                    anchor_col = int(_first_child_text(from_el, "col") or "-1")
+                    anchor_row = int(_first_child_text(from_el, "row") or "-1")
+                except ValueError:
+                    continue
+
+                blip = _first_descendant(anchor, "blip")
+                image_rel_id = blip.attrib.get(embed_attr, "") if blip is not None else ""
+                image_target = drawing_rels.get(image_rel_id, "")
+                image_path = _zip_join(drawing_path, image_target) if image_target else ""
+                candidate = {
+                    "cell": f"{_number_to_col(anchor_col + 1)}{anchor_row + 1}",
+                    "image_path": image_path,
+                }
+                if len(details["candidate_cells"]) < 20:
+                    details["candidate_cells"].append(candidate)
+
+                if anchor_col == target_col and anchor_row == target_row and image_path in zf.namelist():
+                    details["matched_image_path"] = image_path
+                    details["matched_anchor_type"] = local
+                    return zf.read(image_path), details
+
+    return None, details
+
+
+def _sheet_index_from_metainfo(metainfo: Dict[str, Any], sheet_id: str) -> Tuple[int, Dict[str, Any]]:
+    sheets = metainfo.get("sheets", [])
+    for fallback_index, item in enumerate(sheets):
+        current_id = item.get("sheetId") or item.get("sheet_id")
+        if current_id == sheet_id:
+            try:
+                return int(item.get("index", fallback_index)), item
+            except (TypeError, ValueError):
+                return fallback_index, item
+    return 0, {}
+
+
 class FeishuOpenAPI:
     def __init__(self, domain: str, timeout: int) -> None:
         self.domain = (domain or "https://open.feishu.cn").rstrip("/")
@@ -515,6 +666,64 @@ class FeishuOpenAPI:
             token=token,
         )
         return payload.get("data", {}).get("items", [])
+
+    def sheet_metainfo(self, token: str, spreadsheet_token: str) -> Dict[str, Any]:
+        spreadsheet_token = urllib.parse.quote(spreadsheet_token, safe="")
+        payload = self.request(
+            "GET",
+            f"/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/metainfo",
+            token=token,
+            query={"user_id_type": "open_id"},
+        )
+        return payload.get("data", {})
+
+    def export_spreadsheet_xlsx(
+        self,
+        token: str,
+        spreadsheet_token: str,
+        poll_timeout_seconds: int,
+    ) -> Tuple[bytes, Dict[str, Any]]:
+        create_payload = self.request(
+            "POST",
+            "/open-apis/drive/v1/export_tasks",
+            token=token,
+            body={
+                "file_extension": "xlsx",
+                "token": spreadsheet_token,
+                "type": "sheet",
+            },
+        )
+        ticket = create_payload.get("data", {}).get("ticket")
+        if not ticket:
+            raise FeishuAPIError(f"FeishuBaseToSheet v{NODE_VERSION}: Export task did not return a ticket")
+
+        deadline = time.time() + max(5, int(poll_timeout_seconds or 30))
+        last_result: Dict[str, Any] = {}
+        while time.time() <= deadline:
+            query_payload = self.request(
+                "GET",
+                f"/open-apis/drive/v1/export_tasks/{urllib.parse.quote(str(ticket), safe='')}",
+                token=token,
+            )
+            last_result = query_payload.get("data", {}).get("result", {})
+            file_token = last_result.get("file_token")
+            job_status = last_result.get("job_status")
+            if str(job_status) == "0" and file_token:
+                xlsx_bytes = self.request_bytes(
+                    "GET",
+                    f"/open-apis/drive/v1/export_tasks/file/{urllib.parse.quote(str(file_token), safe='')}/download",
+                    token=token,
+                )
+                return xlsx_bytes, {"ticket": ticket, "file_token": file_token, "result": last_result}
+            if str(job_status) in ("-1", "2", "3"):
+                raise FeishuAPIError(
+                    f"FeishuBaseToSheet v{NODE_VERSION}: XLSX export failed: {_json_dumps(last_result)}"
+                )
+            time.sleep(1)
+
+        raise FeishuAPIError(
+            f"FeishuBaseToSheet v{NODE_VERSION}: XLSX export timed out: {_json_dumps(last_result)}"
+        )
 
     def download_media(self, token: str, file_token: str) -> bytes:
         return self.request_bytes(
@@ -899,7 +1108,7 @@ class FeishuSheetCellReader:
                 "column": ("STRING", {"default": "A"}),
                 "read_mode": (["auto", "text", "image"], {"default": "auto"}),
                 "date_time_render_option": (["FormattedString", "SerialNumber"], {"default": "FormattedString"}),
-                "timeout_seconds": ("INT", {"default": 30, "min": 5, "max": 300, "step": 1}),
+                "timeout_seconds": ("INT", {"default": 60, "min": 5, "max": 300, "step": 1}),
             },
             "optional": {
                 "openapi_domain": ("STRING", {"default": "https://open.feishu.cn"}),
@@ -962,8 +1171,6 @@ class FeishuSheetCellReader:
                 float_images = api.query_float_images(access_token, spreadsheet_token, sheet_id)
             except FeishuAPIError as exc:
                 image_lookup_error = str(exc)
-                if read_mode == "image":
-                    raise
             else:
                 for item in float_images:
                     item_range = item.get("range")
@@ -979,8 +1186,6 @@ class FeishuSheetCellReader:
                 image_bytes = api.download_media(access_token, file_tokens[0])
             except FeishuAPIError as exc:
                 image_lookup_error = str(exc)
-                if read_mode == "image":
-                    raise
             else:
                 image = _image_bytes_to_comfy_image(image_bytes)
                 status = {
@@ -998,7 +1203,45 @@ class FeishuSheetCellReader:
                 return text, image, _json_dumps(status), True
 
         if read_mode == "image":
-            raise ValueError("No image token was found in the target Sheet cell. Try read_mode=text to inspect status_json/raw_cell.")
+            metainfo = api.sheet_metainfo(access_token, spreadsheet_token)
+            sheet_index, sheet_info = _sheet_index_from_metainfo(metainfo, sheet_id)
+            xlsx_bytes, export_status = api.export_spreadsheet_xlsx(
+                access_token,
+                spreadsheet_token,
+                timeout_seconds,
+            )
+            image_bytes, xlsx_details = _xlsx_extract_cell_image(xlsx_bytes, sheet_index, cell)
+            if image_bytes:
+                image = _image_bytes_to_comfy_image(image_bytes)
+                status = {
+                    "ok": True,
+                    "version": NODE_VERSION,
+                    "read_type": "image",
+                    "image_source": "xlsx_export",
+                    "range": cell_range,
+                    "row": int(row),
+                    "column": _column_to_letter(column),
+                    "raw_cell": value,
+                    "image_lookup_error": image_lookup_error,
+                    "export": export_status,
+                    "xlsx": xlsx_details,
+                    "sheet": sheet_info,
+                }
+                return text, image, _json_dumps(status), True
+            status = {
+                "ok": False,
+                "version": NODE_VERSION,
+                "read_type": "image",
+                "range": cell_range,
+                "row": int(row),
+                "column": _column_to_letter(column),
+                "raw_cell": value,
+                "image_lookup_error": image_lookup_error,
+                "export": export_status,
+                "xlsx": xlsx_details,
+                "sheet": sheet_info,
+            }
+            return text, _blank_comfy_image(), _json_dumps(status), False
 
         status = {
             "ok": True,
@@ -1022,9 +1265,9 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FeishuBaseToSheet": "Feishu Base To Sheet v0.5.0",
-    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.5.0",
-    "FeishuImageToSheetCell": "Feishu Image To Sheet Cell v0.5.0",
-    "FeishuValueToSheetCell": "Feishu Value To Sheet Cell v0.5.0",
-    "FeishuSheetCellReader": "Feishu Sheet Cell Reader v0.5.0",
+    "FeishuBaseToSheet": "Feishu Base To Sheet v0.6.0",
+    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.6.0",
+    "FeishuImageToSheetCell": "Feishu Image To Sheet Cell v0.6.0",
+    "FeishuValueToSheetCell": "Feishu Value To Sheet Cell v0.6.0",
+    "FeishuSheetCellReader": "Feishu Sheet Cell Reader v0.6.0",
 }
