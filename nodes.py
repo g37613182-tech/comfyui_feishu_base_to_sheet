@@ -18,14 +18,21 @@ def _json_dumps(value: Any) -> str:
 
 
 def _read_secret(value: str, env_name: str) -> str:
-    value = (value or "").strip()
+    value = _clean_text_input(value)
     if value:
         return value
     return os.getenv(env_name, "").strip()
 
 
-def _extract_token(value: str, patterns: Sequence[str]) -> str:
+def _clean_text_input(value: str) -> str:
     value = (value or "").strip()
+    if re.fullmatch(r"请输入[\w_]+", value):
+        return ""
+    return value
+
+
+def _extract_token(value: str, patterns: Sequence[str]) -> str:
+    value = _clean_text_input(value)
     if not value:
         return ""
     if "://" not in value:
@@ -56,6 +63,7 @@ def _first_query_value(value: str, keys: Sequence[str]) -> str:
 
 
 def _split_names(raw: str) -> List[str]:
+    raw = _clean_text_input(raw)
     if not raw:
         return []
     parts = re.split(r"[\n,，]+", raw)
@@ -390,6 +398,14 @@ class FeishuBaseToSheet:
     ) -> Tuple[str, int, int]:
         app_id = _read_secret(app_id, "FEISHU_APP_ID")
         app_secret = _read_secret(app_secret, "FEISHU_APP_SECRET")
+        base_url_or_token = _clean_text_input(base_url_or_token)
+        base_table_id = _clean_text_input(base_table_id)
+        spreadsheet_url_or_token = _clean_text_input(spreadsheet_url_or_token)
+        sheet_id = _clean_text_input(sheet_id)
+        start_cell = _clean_text_input(start_cell) or "A1"
+        view_id = _clean_text_input(view_id)
+        field_names = _clean_text_input(field_names)
+        openapi_domain = _clean_text_input(openapi_domain) or "https://open.feishu.cn"
         if not app_id or not app_secret:
             raise ValueError("app_id/app_secret are required, or set FEISHU_APP_ID and FEISHU_APP_SECRET")
 
@@ -409,6 +425,8 @@ class FeishuBaseToSheet:
             raise ValueError("base_table_id is required, or pass a Base URL containing ?table=tbl...")
         if not spreadsheet_token:
             raise ValueError("spreadsheet_url_or_token must be a Sheet URL or spreadsheet token")
+        if not sheet_id:
+            raise ValueError("sheet_id is required, or pass a Sheet URL containing ?sheet=xxxx")
 
         api = FeishuOpenAPI(openapi_domain, timeout_seconds)
         access_token = api.tenant_access_token(app_id, app_secret)
@@ -430,7 +448,7 @@ class FeishuBaseToSheet:
             app_token,
             table_id,
             view_id,
-            ordered_names,
+            requested_names,
             page_size,
             int(max_records or 0),
         )
