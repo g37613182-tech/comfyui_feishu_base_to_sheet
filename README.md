@@ -54,3 +54,22 @@ $env:FEISHU_APP_SECRET="xxx"
 - 附件字段会被写成可读字符串或 JSON，不会自动下载或上传附件。
 - 日期字段会尽量从毫秒时间戳转为 `YYYY-MM-DD` 或 ISO 时间字符串。
 - 节点会自动按 5000 行分批写入；飞书 Sheet 单次最多 100 列，超过时请用 `field_names` 选择需要搬运的字段。
+
+## 写入图片到 Sheet 单元格
+
+`Feishu Image To Sheet Cell v0.3.0` 可以把 ComfyUI 的 `IMAGE` 写入普通飞书 Sheet 的单个单元格。
+
+典型连接方式：
+
+```text
+BAResourceConvert(output_type=图片) -> Feishu Image To Sheet Cell v0.3.0(image)
+```
+
+关键参数：
+
+- `spreadsheet_url_or_token`：目标飞书普通表格 URL 或 token。
+- `sheet_id`：目标工作表 ID；如果 URL 带 `?sheet=xxxx` 可以留空。
+- `cell`：单元格位置，例如 `C2`。也可以写成 `sheet_id!C2`。
+- `image_name`：写入图片名称，例如 `attachment.png`。
+
+这个节点调用飞书 Sheet 的 `values_image` 接口，适合把 Base 附件下载后的图片写进 Sheet。非图片附件不能作为单元格图片写入，建议写文件名、JSON 或上传到云空间后写链接。

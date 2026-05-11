@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import re
 import time
@@ -9,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-NODE_VERSION = "0.2.0"
+NODE_VERSION = "0.3.0"
 
 
 class FeishuAPIError(RuntimeError):
@@ -185,6 +186,39 @@ def _to_sheet_cell(value: Any, field: Optional[Dict[str, Any]], flatten_complex:
     return str(value)
 
 
+def _image_to_png_bytes(image: Any) -> bytes:
+    from PIL import Image
+    import numpy as np
+
+    if isinstance(image, (list, tuple)):
+        if not image:
+            raise ValueError("image input is empty")
+        image = image[0]
+
+    if hasattr(image, "detach"):
+        image = image.detach().cpu().numpy()
+
+    array = np.asarray(image)
+    if array.ndim == 4:
+        array = array[0]
+    if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
+        array = np.transpose(array, (1, 2, 0))
+    if array.ndim == 2:
+        pass
+    elif array.ndim != 3 or array.shape[-1] not in (1, 3, 4):
+        raise ValueError(f"Unsupported IMAGE shape for Sheet image write: {array.shape}")
+
+    if np.issubdtype(array.dtype, np.floating):
+        array = np.clip(array, 0.0, 1.0) * 255.0
+    array = np.clip(array, 0, 255).astype(np.uint8)
+    if array.ndim == 3 and array.shape[-1] == 1:
+        array = array[:, :, 0]
+
+    buffer = io.BytesIO()
+    Image.fromarray(array).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 class FeishuOpenAPI:
     def __init__(self, domain: str, timeout: int) -> None:
         self.domain = (domain or "https://open.feishu.cn").rstrip("/")
@@ -341,6 +375,27 @@ class FeishuOpenAPI:
                 token=token,
                 body={"valueRanges": [{"range": cell_range, "values": values}]},
             )
+        return payload.get("data", {})
+
+    def write_image(
+        self,
+        token: str,
+        spreadsheet_token: str,
+        cell_range: str,
+        image_bytes: bytes,
+        image_name: str,
+    ) -> Dict[str, Any]:
+        spreadsheet_token = urllib.parse.quote(spreadsheet_token, safe="")
+        payload = self.request(
+            "POST",
+            f"/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values_image",
+            token=token,
+            body={
+                "range": cell_range,
+                "image": list(image_bytes),
+                "name": image_name or "image.png",
+            },
+        )
         return payload.get("data", {})
 
 
@@ -508,12 +563,90 @@ class FeishuBaseToSheet:
         return _json_dumps(status), len(rows), len(ordered_names)
 
 
+class FeishuImageToSheetCell:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "app_id": ("STRING", {"default": ""}),
+                "app_secret": ("STRING", {"default": ""}),
+                "spreadsheet_url_or_token": ("STRING", {"default": ""}),
+                "sheet_id": ("STRING", {"default": ""}),
+                "cell": ("STRING", {"default": "A1"}),
+                "image_name": ("STRING", {"default": "image.png"}),
+                "timeout_seconds": ("INT", {"default": 30, "min": 5, "max": 300, "step": 1}),
+            },
+            "optional": {
+                "openapi_domain": ("STRING", {"default": "https://open.feishu.cn"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("status_json",)
+    FUNCTION = "write_image"
+    CATEGORY = "Feishu"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return time.time()
+
+    def write_image(
+        self,
+        image: Any,
+        app_id: str,
+        app_secret: str,
+        spreadsheet_url_or_token: str,
+        sheet_id: str,
+        cell: str,
+        image_name: str,
+        timeout_seconds: int,
+        openapi_domain: str = "https://open.feishu.cn",
+    ) -> Tuple[str]:
+        app_id = _read_secret(app_id, "FEISHU_APP_ID")
+        app_secret = _read_secret(app_secret, "FEISHU_APP_SECRET")
+        spreadsheet_url_or_token = _clean_text_input(spreadsheet_url_or_token)
+        sheet_id = _clean_text_input(sheet_id)
+        cell = _clean_text_input(cell) or "A1"
+        image_name = _clean_text_input(image_name) or "image.png"
+        openapi_domain = _clean_text_input(openapi_domain) or "https://open.feishu.cn"
+        if not app_id or not app_secret:
+            raise ValueError("app_id/app_secret are required, or set FEISHU_APP_ID and FEISHU_APP_SECRET")
+
+        spreadsheet_token = _extract_token(spreadsheet_url_or_token, [r"/sheets/([^/?#]+)"])
+        sheet_id = (sheet_id or _first_query_value(spreadsheet_url_or_token, ["sheet", "sheet_id"])).strip()
+        if not sheet_id and "!" in cell:
+            sheet_id = cell.split("!", 1)[0].strip()
+        if not spreadsheet_token:
+            raise ValueError("spreadsheet_url_or_token must be a Sheet URL or spreadsheet token")
+        if not sheet_id:
+            raise ValueError("sheet_id is required, or pass a Sheet URL containing ?sheet=xxxx")
+
+        cell_range = _make_range(sheet_id, cell, 1, 1)
+        image_bytes = _image_to_png_bytes(image)
+        api = FeishuOpenAPI(openapi_domain, timeout_seconds)
+        access_token = api.tenant_access_token(app_id, app_secret)
+        write_result = api.write_image(access_token, spreadsheet_token, cell_range, image_bytes, image_name)
+        status = {
+            "ok": True,
+            "version": NODE_VERSION,
+            "range": cell_range,
+            "image_name": image_name,
+            "image_bytes": len(image_bytes),
+            "feishu_response": write_result,
+        }
+        return (_json_dumps(status),)
+
+
 NODE_CLASS_MAPPINGS = {
     "FeishuBaseToSheet": FeishuBaseToSheet,
     "FeishuBaseToSheetV020": FeishuBaseToSheet,
+    "FeishuImageToSheetCell": FeishuImageToSheetCell,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FeishuBaseToSheet": "Feishu Base To Sheet v0.2.0",
-    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.2.0",
+    "FeishuBaseToSheet": "Feishu Base To Sheet v0.3.0",
+    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.3.0",
+    "FeishuImageToSheetCell": "Feishu Image To Sheet Cell v0.3.0",
 }
