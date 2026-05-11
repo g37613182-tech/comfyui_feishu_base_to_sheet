@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
 
-NODE_VERSION = "0.7.0"
+NODE_VERSION = "0.8.0"
 
 
 class FeishuAPIError(RuntimeError):
@@ -282,6 +282,12 @@ def _extract_file_tokens(value: Any) -> List[str]:
         for token in re.findall(r"box[a-zA-Z0-9_-]+", raw):
             if token not in tokens:
                 tokens.append(token)
+        for token in re.findall(
+            r"(?i)[\"']?(?:fileToken|file_token|imageToken|float_image_token)[\"']?\s*[:=]\s*[\"']([A-Za-z0-9_-]{8,})[\"']",
+            raw,
+        ):
+            if token not in tokens:
+                tokens.append(token)
         plain = raw.strip()
         if allow_plain and re.fullmatch(r"[A-Za-z0-9_-]{8,}", plain) and plain not in tokens:
             tokens.append(plain)
@@ -297,6 +303,11 @@ def _extract_file_tokens(value: Any) -> List[str]:
             for value in item:
                 walk(value)
         else:
+            if isinstance(item, str) and item.strip().startswith(("{", "[")):
+                try:
+                    walk(json.loads(item))
+                except json.JSONDecodeError:
+                    pass
             add_token(item)
 
     walk(value)
@@ -311,6 +322,15 @@ def _looks_like_sheet_image_value(value: Any) -> bool:
         return any(_looks_like_sheet_image_value(item) for item in value.values())
     if isinstance(value, list):
         return any(_looks_like_sheet_image_value(item) for item in value)
+    if isinstance(value, str):
+        if re.search(r"(?i)fileToken|file_token|imageToken|float_image_token", value):
+            return True
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                return _looks_like_sheet_image_value(json.loads(stripped))
+            except json.JSONDecodeError:
+                return False
     return False
 
 
@@ -1298,9 +1318,9 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FeishuBaseToSheet": "Feishu Base To Sheet v0.7.0",
-    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.7.0",
-    "FeishuImageToSheetCell": "Feishu Image To Sheet Cell v0.7.0",
-    "FeishuValueToSheetCell": "Feishu Value To Sheet Cell v0.7.0",
-    "FeishuSheetCellReader": "Feishu Sheet Cell Reader v0.7.0",
+    "FeishuBaseToSheet": "Feishu Base To Sheet v0.8.0",
+    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.8.0",
+    "FeishuImageToSheetCell": "Feishu Image To Sheet Cell v0.8.0",
+    "FeishuValueToSheetCell": "Feishu Value To Sheet Cell v0.8.0",
+    "FeishuSheetCellReader": "Feishu Sheet Cell Reader v0.8.0",
 }
