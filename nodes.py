@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
 
-NODE_VERSION = "0.8.0"
+NODE_VERSION = "1.0.0"
 
 
 class FeishuAPIError(RuntimeError):
@@ -1309,18 +1309,20 @@ class FeishuSheetCellReader:
         return text, _blank_comfy_image(), _json_dumps(status), False
 
 
+class FeishuSheetWriter(FeishuValueToSheetCell):
+    pass
+
+
+class FeishuSheetReader(FeishuSheetCellReader):
+    pass
+
+
 NODE_CLASS_MAPPINGS = {
-    "FeishuBaseToSheet": FeishuBaseToSheet,
-    "FeishuBaseToSheetV020": FeishuBaseToSheet,
-    "FeishuImageToSheetCell": FeishuImageToSheetCell,
-    "FeishuValueToSheetCell": FeishuValueToSheetCell,
-    "FeishuSheetCellReader": FeishuSheetCellReader,
+    "FeishuSheetReader": FeishuSheetReader,
+    "FeishuSheetWriter": FeishuSheetWriter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FeishuBaseToSheet": "Feishu Base To Sheet v0.8.0",
-    "FeishuBaseToSheetV020": "Feishu Base To Sheet v0.8.0",
-    "FeishuImageToSheetCell": "Feishu Image To Sheet Cell v0.8.0",
-    "FeishuValueToSheetCell": "Feishu Value To Sheet Cell v0.8.0",
-    "FeishuSheetCellReader": "Feishu Sheet Cell Reader v0.8.0",
+    "FeishuSheetReader": "Feishu Sheet Reader v1.0.0",
+    "FeishuSheetWriter": "Feishu Sheet Writer v1.0.0",
 }
