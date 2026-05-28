@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
 
-NODE_VERSION = "1.1.1"
+NODE_VERSION = "1.1.2"
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".mpeg", ".mpg", ".3gp"}
 MAX_DIRECT_DRIVE_UPLOAD_BYTES = 20 * 1024 * 1024
 
@@ -62,7 +62,21 @@ def _sheet_file_url(file_token: str, spreadsheet_url_or_token: str) -> str:
     parsed = urllib.parse.urlparse(spreadsheet_url_or_token)
     if not parsed.scheme or not parsed.netloc:
         return file_token
-    return f"{parsed.scheme}://{parsed.netloc}/file/{urllib.parse.quote(file_token, safe='')}"
+    return f"{parsed.scheme}://{parsed.netloc}/drive/file/{urllib.parse.quote(file_token, safe='')}"
+
+
+def _drive_url_from_upload(upload_result: Dict[str, Any], file_token: str, spreadsheet_url_or_token: str) -> str:
+    for key in ("url", "file_url", "link", "web_url"):
+        value = upload_result.get(key)
+        if isinstance(value, str) and _is_http_url(value):
+            return value
+    file_info = upload_result.get("file")
+    if isinstance(file_info, dict):
+        for key in ("url", "file_url", "link", "web_url"):
+            value = file_info.get(key)
+            if isinstance(value, str) and _is_http_url(value):
+                return value
+    return _sheet_file_url(file_token, spreadsheet_url_or_token)
 
 
 def _safe_filename(name: str, default: str) -> str:
@@ -1528,17 +1542,17 @@ class FeishuValueToSheetCell:
                     f"FeishuBaseToSheet v{NODE_VERSION}: Drive upload did not return file_token: "
                     f"{_json_dumps(upload_result)}"
                 )
+            drive_url = _drive_url_from_upload(upload_result, file_token, spreadsheet_url_or_token)
             cell_value = {
-                "type": "mention",
-                "textType": "fileToken",
-                "text": file_token,
-                "objType": "file",
+                "type": "url",
+                "text": safe_video_name,
+                "link": drive_url,
             }
             write_result = api.write_values(access_token, spreadsheet_token, cell_range, [[cell_value]], "overwrite")
             status = {
                 "ok": True,
                 "version": NODE_VERSION,
-                "write_type": "video_file",
+                "write_type": "video_file_url",
                 "range": cell_range,
                 "row": int(row),
                 "column": _column_to_letter(column),
@@ -1546,7 +1560,7 @@ class FeishuValueToSheetCell:
                 "video_path_or_url": video_path_or_url,
                 "video_input_detected": bool(video is not None),
                 "file_token": file_token,
-                "drive_url": _sheet_file_url(file_token, spreadsheet_url_or_token),
+                "drive_url": drive_url,
                 "drive_parent_node": drive_folder_token,
                 "drive_parent_note": "empty means Feishu Drive root",
                 "upload": upload_result,
@@ -1818,6 +1832,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FeishuSheetReader": "Feishu Sheet Reader v1.1.1",
-    "FeishuSheetWriter": "Feishu Sheet Writer v1.1.1",
+    "FeishuSheetReader": "Feishu Sheet Reader v1.1.2",
+    "FeishuSheetWriter": "Feishu Sheet Writer v1.1.2",
 }
