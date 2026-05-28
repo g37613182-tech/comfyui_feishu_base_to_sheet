@@ -1,8 +1,10 @@
 import json
 import io
+import mimetypes
 import os
 import posixpath
 import re
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -13,7 +15,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
 
-NODE_VERSION = "1.0.0"
+NODE_VERSION = "1.1.0"
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".mpeg", ".mpg", ".3gp"}
+MAX_DIRECT_DRIVE_UPLOAD_BYTES = 20 * 1024 * 1024
 
 
 class FeishuAPIError(RuntimeError):
@@ -36,6 +40,28 @@ def _clean_text_input(value: str) -> str:
     if re.fullmatch(r"请输入[\w_]+", value):
         return ""
     return value
+
+
+def _is_http_url(value: str) -> bool:
+    value = _clean_text_input(value)
+    return value.startswith("http://") or value.startswith("https://")
+
+
+def _sheet_file_url(file_token: str, spreadsheet_url_or_token: str) -> str:
+    file_token = _clean_text_input(file_token)
+    if not file_token or "://" not in (spreadsheet_url_or_token or ""):
+        return file_token
+    parsed = urllib.parse.urlparse(spreadsheet_url_or_token)
+    if not parsed.scheme or not parsed.netloc:
+        return file_token
+    return f"{parsed.scheme}://{parsed.netloc}/file/{urllib.parse.quote(file_token, safe='')}"
+
+
+def _safe_filename(name: str, default: str) -> str:
+    name = _clean_text_input(name) or default
+    name = os.path.basename(name.replace("\\", "/"))
+    name = re.sub(r"[^\w.\- ()\u4e00-\u9fff]+", "_", name).strip(" ._")
+    return name or default
 
 
 def _extract_token(value: str, patterns: Sequence[str]) -> str:
@@ -314,6 +340,92 @@ def _extract_file_tokens(value: Any) -> List[str]:
     return tokens
 
 
+def _extract_file_items(value: Any) -> List[Dict[str, str]]:
+    items: List[Dict[str, str]] = []
+
+    def add_item(token: str = "", name: str = "", url: str = "", kind: str = "") -> None:
+        token = _clean_text_input(token)
+        url = _clean_text_input(url)
+        name = _clean_text_input(name)
+        if not token and not url:
+            return
+        item = {"token": token, "name": name, "url": url, "kind": kind}
+        marker = (token, url)
+        if marker not in [(existing.get("token"), existing.get("url")) for existing in items]:
+            items.append(item)
+
+    def parse_json_string(raw: str) -> bool:
+        stripped = raw.strip()
+        if not stripped.startswith(("{", "[")):
+            return False
+        try:
+            walk(json.loads(stripped))
+            return True
+        except json.JSONDecodeError:
+            return False
+
+    def walk(item: Any) -> None:
+        if isinstance(item, dict):
+            token = ""
+            for key in ("fileToken", "file_token", "imageToken", "float_image_token", "token", "text"):
+                value = item.get(key)
+                if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{8,}", value.strip()):
+                    token = value.strip()
+                    break
+            name = ""
+            for key in ("name", "file_name", "filename", "title", "text"):
+                value = item.get(key)
+                if isinstance(value, str) and value and value != token:
+                    name = value
+                    break
+            url = ""
+            for key in ("url", "link", "tmp_url"):
+                value = item.get(key)
+                if isinstance(value, str) and _is_http_url(value):
+                    url = value
+                    break
+            kind = str(item.get("type") or item.get("objType") or item.get("mime_type") or item.get("mimeType") or "")
+            add_item(token=token, name=name, url=url, kind=kind)
+            for value in item.values():
+                walk(value)
+        elif isinstance(item, list):
+            for value in item:
+                walk(value)
+        elif isinstance(item, str):
+            if parse_json_string(item):
+                return
+            for url in re.findall(r"https?://[^\s\"'<>，。]+", item):
+                add_item(url=url, name=os.path.basename(urllib.parse.urlparse(url).path), kind="")
+            for token in _extract_file_tokens(item):
+                add_item(token=token, kind="")
+
+    walk(value)
+    return items
+
+
+def _looks_like_video_item(item: Dict[str, str]) -> bool:
+    haystack = " ".join([item.get("name", ""), item.get("url", ""), item.get("kind", "")]).lower()
+    if "video" in haystack or "mp4" in haystack:
+        return True
+    parsed_path = urllib.parse.urlparse(item.get("url", "")).path
+    suffixes = [os.path.splitext(item.get("name", ""))[1].lower(), os.path.splitext(parsed_path)[1].lower()]
+    return any(suffix in VIDEO_EXTENSIONS for suffix in suffixes)
+
+
+def _write_temp_video(video_bytes: bytes, file_name: str, file_token: str) -> str:
+    file_name = _safe_filename(file_name, "video.mp4")
+    base, ext = os.path.splitext(file_name)
+    if not ext:
+        ext = ".mp4"
+    target_dir = os.path.join(tempfile.gettempdir(), "comfyui_feishu_sheet")
+    os.makedirs(target_dir, exist_ok=True)
+    token_part = re.sub(r"\W+", "", file_token or str(int(time.time())))[:12]
+    path = os.path.join(target_dir, f"{base}_{token_part}{ext}")
+    with open(path, "wb") as handle:
+        handle.write(video_bytes)
+    return path
+
+
 def _looks_like_sheet_image_value(value: Any) -> bool:
     if isinstance(value, dict):
         keys = {str(key).lower() for key in value.keys()}
@@ -576,6 +688,59 @@ class FeishuOpenAPI:
         except urllib.error.URLError as exc:
             raise FeishuAPIError(f"FeishuBaseToSheet v{NODE_VERSION}: Network error while calling Feishu OpenAPI: {exc.reason}") from exc
 
+    def request_multipart(
+        self,
+        path: str,
+        token: str,
+        fields: Dict[str, Any],
+        file_field: str,
+        file_path: str,
+        file_name: str,
+    ) -> Dict[str, Any]:
+        boundary = f"----ComfyUIFeishu{int(time.time() * 1000)}"
+        content_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+        body = io.BytesIO()
+
+        def write_line(value: bytes) -> None:
+            body.write(value + b"\r\n")
+
+        for key, value in fields.items():
+            write_line(f"--{boundary}".encode("utf-8"))
+            write_line(f'Content-Disposition: form-data; name="{key}"'.encode("utf-8"))
+            write_line(b"")
+            write_line(str(value).encode("utf-8"))
+
+        write_line(f"--{boundary}".encode("utf-8"))
+        disposition = f'Content-Disposition: form-data; name="{file_field}"; filename="{file_name}"'
+        write_line(disposition.encode("utf-8"))
+        write_line(f"Content-Type: {content_type}".encode("utf-8"))
+        write_line(b"")
+        with open(file_path, "rb") as handle:
+            body.write(handle.read())
+        body.write(b"\r\n")
+        write_line(f"--{boundary}--".encode("utf-8"))
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        }
+        req = urllib.request.Request(f"{self.domain}{path}", data=body.getvalue(), headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            raise FeishuAPIError(f"FeishuBaseToSheet v{NODE_VERSION}: {self._format_http_error(exc.code, raw)}") from exc
+        except urllib.error.URLError as exc:
+            raise FeishuAPIError(f"FeishuBaseToSheet v{NODE_VERSION}: Network error while calling Feishu OpenAPI: {exc.reason}") from exc
+
+        payload = json.loads(raw) if raw else {}
+        code = payload.get("code", 0)
+        if code != 0:
+            msg = payload.get("msg") or payload.get("message") or "Feishu OpenAPI returned an error"
+            raise FeishuAPIError(f"FeishuBaseToSheet v{NODE_VERSION}: Feishu OpenAPI error code={code}: {msg}")
+        return payload
+
     @staticmethod
     def _format_http_error(code: int, raw: str) -> str:
         try:
@@ -773,6 +938,48 @@ class FeishuOpenAPI:
             f"/open-apis/drive/v1/medias/{urllib.parse.quote(file_token, safe='')}/download",
             token=token,
         )
+
+    def upload_drive_file(
+        self,
+        token: str,
+        file_path: str,
+        file_name: str,
+        folder_token: str,
+    ) -> Dict[str, Any]:
+        size = os.path.getsize(file_path)
+        if size > MAX_DIRECT_DRIVE_UPLOAD_BYTES:
+            max_mb = MAX_DIRECT_DRIVE_UPLOAD_BYTES // (1024 * 1024)
+            raise ValueError(
+                f"Direct video upload is limited to {max_mb} MB for now. "
+                "Use a video URL or upload the file to Feishu Drive first."
+            )
+        folder_token = _clean_text_input(folder_token)
+        if not folder_token:
+            raise ValueError("drive_folder_token is required when writing a local video file")
+        payload = self.request_multipart(
+            "/open-apis/drive/v1/files/upload_all",
+            token,
+            {
+                "file_name": file_name,
+                "parent_type": "explorer",
+                "parent_node": folder_token,
+                "size": size,
+            },
+            "file",
+            file_path,
+            file_name,
+        )
+        return payload.get("data", {})
+
+    def download_drive_file(self, token: str, file_token: str) -> bytes:
+        try:
+            return self.request_bytes(
+                "GET",
+                f"/open-apis/drive/v1/files/{urllib.parse.quote(file_token, safe='')}/download",
+                token=token,
+            )
+        except FeishuAPIError:
+            return self.download_media(token, file_token)
 
     def write_image(
         self,
@@ -1047,13 +1254,16 @@ class FeishuValueToSheetCell:
                 "sheet_id": ("STRING", {"default": ""}),
                 "row": ("INT", {"default": 1, "min": 1, "max": 1000000, "step": 1}),
                 "column": ("STRING", {"default": "A"}),
-                "mode": (["auto", "text", "image"], {"default": "auto"}),
+                "mode": (["auto", "text", "image", "video"], {"default": "auto"}),
                 "image_name": ("STRING", {"default": "image.png"}),
+                "video_name": ("STRING", {"default": "video.mp4"}),
                 "timeout_seconds": ("INT", {"default": 30, "min": 5, "max": 300, "step": 1}),
             },
             "optional": {
                 "text": ("STRING", {"default": "", "multiline": True}),
                 "image": ("IMAGE",),
+                "video_path_or_url": ("STRING", {"default": ""}),
+                "drive_folder_token": ("STRING", {"default": ""}),
                 "openapi_domain": ("STRING", {"default": "https://open.feishu.cn"}),
             },
         }
@@ -1078,9 +1288,12 @@ class FeishuValueToSheetCell:
         column: str,
         mode: str,
         image_name: str,
+        video_name: str,
         timeout_seconds: int,
         text: str = "",
         image: Any = None,
+        video_path_or_url: str = "",
+        drive_folder_token: str = "",
         openapi_domain: str = "https://open.feishu.cn",
     ) -> Tuple[str]:
         app_id = _read_secret(app_id, "FEISHU_APP_ID")
@@ -1089,6 +1302,8 @@ class FeishuValueToSheetCell:
         sheet_id = _clean_text_input(sheet_id)
         cell = _cell_from_row_column(row, column)
         image_name = _clean_text_input(image_name) or "image.png"
+        video_path_or_url = _clean_text_input(video_path_or_url)
+        drive_folder_token = _clean_text_input(drive_folder_token)
         text = "" if text is None else str(text)
         openapi_domain = _clean_text_input(openapi_domain) or "https://open.feishu.cn"
         if not app_id or not app_secret:
@@ -1104,6 +1319,79 @@ class FeishuValueToSheetCell:
         api = FeishuOpenAPI(openapi_domain, timeout_seconds)
         access_token = api.tenant_access_token(app_id, app_secret)
         cell_range = _make_range(sheet_id, cell, 1, 1)
+
+        if mode == "video" or (mode == "auto" and video_path_or_url):
+            if not video_path_or_url:
+                raise ValueError("mode=video requires video_path_or_url")
+            inferred_name = os.path.basename(urllib.parse.urlparse(video_path_or_url).path) or "video.mp4"
+            requested_video_name = _clean_text_input(video_name)
+            if not requested_video_name or requested_video_name == "video.mp4":
+                requested_video_name = inferred_name
+            safe_video_name = _safe_filename(requested_video_name, "video.mp4")
+            if _is_http_url(video_path_or_url):
+                cell_value = {
+                    "type": "url",
+                    "text": safe_video_name,
+                    "link": video_path_or_url,
+                }
+                write_result = api.write_values(access_token, spreadsheet_token, cell_range, [[cell_value]], "overwrite")
+                status = {
+                    "ok": True,
+                    "version": NODE_VERSION,
+                    "write_type": "video_url",
+                    "range": cell_range,
+                    "row": int(row),
+                    "column": _column_to_letter(column),
+                    "video_name": safe_video_name,
+                    "video_path_or_url": video_path_or_url,
+                    "feishu_response": write_result,
+                }
+                return (_json_dumps(status),)
+
+            if not os.path.isfile(video_path_or_url):
+                raise ValueError(f"video_path_or_url is not a local file: {video_path_or_url}")
+            if requested_video_name == "video.mp4":
+                safe_video_name = _safe_filename(os.path.basename(video_path_or_url), "video.mp4")
+            upload_result = api.upload_drive_file(
+                access_token,
+                video_path_or_url,
+                safe_video_name,
+                drive_folder_token,
+            )
+            file_token = (
+                upload_result.get("file_token")
+                or upload_result.get("fileToken")
+                or upload_result.get("token")
+                or upload_result.get("file", {}).get("token")
+                or upload_result.get("file", {}).get("file_token")
+            )
+            if not file_token:
+                raise FeishuAPIError(
+                    f"FeishuBaseToSheet v{NODE_VERSION}: Drive upload did not return file_token: "
+                    f"{_json_dumps(upload_result)}"
+                )
+            cell_value = {
+                "type": "mention",
+                "textType": "fileToken",
+                "text": file_token,
+                "objType": "file",
+            }
+            write_result = api.write_values(access_token, spreadsheet_token, cell_range, [[cell_value]], "overwrite")
+            status = {
+                "ok": True,
+                "version": NODE_VERSION,
+                "write_type": "video_file",
+                "range": cell_range,
+                "row": int(row),
+                "column": _column_to_letter(column),
+                "video_name": safe_video_name,
+                "video_path_or_url": video_path_or_url,
+                "file_token": file_token,
+                "drive_url": _sheet_file_url(file_token, spreadsheet_url_or_token),
+                "upload": upload_result,
+                "feishu_response": write_result,
+            }
+            return (_json_dumps(status),)
 
         if mode == "image" or (mode == "auto" and image is not None):
             if image is None:
@@ -1148,7 +1436,7 @@ class FeishuSheetCellReader:
                 "sheet_id": ("STRING", {"default": ""}),
                 "row": ("INT", {"default": 1, "min": 1, "max": 1000000, "step": 1}),
                 "column": ("STRING", {"default": "A"}),
-                "read_mode": (["auto", "text", "image"], {"default": "auto"}),
+                "read_mode": (["auto", "text", "image", "video"], {"default": "auto"}),
                 "date_time_render_option": (["FormattedString", "SerialNumber"], {"default": "FormattedString"}),
                 "timeout_seconds": ("INT", {"default": 60, "min": 5, "max": 300, "step": 1}),
             },
@@ -1157,8 +1445,8 @@ class FeishuSheetCellReader:
             },
         }
 
-    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "BOOLEAN")
-    RETURN_NAMES = ("text", "image", "status_json", "has_image")
+    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "BOOLEAN", "STRING", "BOOLEAN")
+    RETURN_NAMES = ("text", "image", "status_json", "has_image", "video_path_or_url", "has_video")
     FUNCTION = "read_cell"
     CATEGORY = "Feishu"
     OUTPUT_NODE = True
@@ -1179,7 +1467,7 @@ class FeishuSheetCellReader:
         date_time_render_option: str,
         timeout_seconds: int,
         openapi_domain: str = "https://open.feishu.cn",
-    ) -> Tuple[str, Any, str, bool]:
+    ) -> Tuple[str, Any, str, bool, str, bool]:
         app_id = _read_secret(app_id, "FEISHU_APP_ID")
         app_secret = _read_secret(app_secret, "FEISHU_APP_SECRET")
         spreadsheet_url_or_token = _clean_text_input(spreadsheet_url_or_token)
@@ -1204,6 +1492,52 @@ class FeishuSheetCellReader:
         values = data.get("valueRange", {}).get("values", [[]])
         value = values[0][0] if values and values[0] else ""
         text = _cell_value_to_text(value)
+
+        file_items = _extract_file_items(value) if read_mode in ("auto", "video") else []
+        video_items = [item for item in file_items if _looks_like_video_item(item)]
+        if read_mode == "video" and not video_items:
+            video_items = file_items
+        if read_mode in ("auto", "video") and video_items:
+            item = video_items[0]
+            video_output = item.get("url", "")
+            video_source = "url" if video_output else ""
+            video_lookup_error = ""
+            if not video_output and item.get("token"):
+                try:
+                    video_bytes = api.download_drive_file(access_token, item["token"])
+                    video_output = _write_temp_video(video_bytes, item.get("name", "") or "video.mp4", item["token"])
+                    video_source = "drive_download"
+                except Exception as exc:
+                    video_lookup_error = str(exc)
+                    video_output = _sheet_file_url(item["token"], spreadsheet_url_or_token)
+                    video_source = "file_token"
+            status = {
+                "ok": bool(video_output),
+                "version": NODE_VERSION,
+                "read_type": "video",
+                "video_source": video_source,
+                "range": cell_range,
+                "row": int(row),
+                "column": _column_to_letter(column),
+                "video_path_or_url": video_output,
+                "file_item": item,
+                "video_lookup_error": video_lookup_error,
+                "raw_cell": value,
+            }
+            return text, _blank_comfy_image(), _json_dumps(status), False, video_output, bool(video_output)
+
+        if read_mode == "video":
+            status = {
+                "ok": False,
+                "version": NODE_VERSION,
+                "read_type": "video",
+                "range": cell_range,
+                "row": int(row),
+                "column": _column_to_letter(column),
+                "raw_cell": value,
+                "file_items": file_items,
+            }
+            return text, _blank_comfy_image(), _json_dumps(status), False, "", False
 
         image_like_value = _looks_like_sheet_image_value(value)
         file_tokens = _extract_file_tokens(value) if read_mode in ("auto", "image") else []
@@ -1243,7 +1577,7 @@ class FeishuSheetCellReader:
                     "image_bytes": len(image_bytes),
                     "raw_cell": value,
                 }
-                return text, image, _json_dumps(status), True
+                return text, image, _json_dumps(status), True, "", False
 
         should_try_xlsx = read_mode == "image" or (read_mode == "auto" and image_like_value)
         if should_try_xlsx:
@@ -1278,7 +1612,7 @@ class FeishuSheetCellReader:
                     "xlsx": xlsx_details,
                     "sheet": sheet_info,
                 }
-                return text, image, _json_dumps(status), True
+                return text, image, _json_dumps(status), True, "", False
             status = {
                 "ok": False,
                 "version": NODE_VERSION,
@@ -1293,7 +1627,7 @@ class FeishuSheetCellReader:
                 "xlsx": xlsx_details,
                 "sheet": sheet_info,
             }
-            return text, _blank_comfy_image(), _json_dumps(status), False
+            return text, _blank_comfy_image(), _json_dumps(status), False, "", False
 
         status = {
             "ok": True,
@@ -1306,7 +1640,7 @@ class FeishuSheetCellReader:
             "image_lookup_error": image_lookup_error,
             "raw_cell": value,
         }
-        return text, _blank_comfy_image(), _json_dumps(status), False
+        return text, _blank_comfy_image(), _json_dumps(status), False, "", False
 
 
 class FeishuSheetWriter(FeishuValueToSheetCell):
@@ -1323,6 +1657,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FeishuSheetReader": "Feishu Sheet Reader v1.0.0",
-    "FeishuSheetWriter": "Feishu Sheet Writer v1.0.0",
+    "FeishuSheetReader": "Feishu Sheet Reader v1.1.0",
+    "FeishuSheetWriter": "Feishu Sheet Writer v1.1.0",
 }
