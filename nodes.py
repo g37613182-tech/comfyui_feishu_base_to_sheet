@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
 
-NODE_VERSION = "1.1.3"
+NODE_VERSION = "1.1.4"
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".mpeg", ".mpg", ".3gp"}
 MAX_DIRECT_DRIVE_UPLOAD_BYTES = 20 * 1024 * 1024
 
@@ -588,6 +588,30 @@ def _looks_like_video_item(item: Dict[str, str]) -> bool:
     parsed_path = urllib.parse.urlparse(item.get("url", "")).path
     suffixes = [os.path.splitext(item.get("name", ""))[1].lower(), os.path.splitext(parsed_path)[1].lower()]
     return any(suffix in VIDEO_EXTENSIONS for suffix in suffixes)
+
+
+def _raw_cell_to_supported_value(value: Any, spreadsheet_url_or_token: str) -> Tuple[Any, str]:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value, "primitive"
+    if isinstance(value, dict):
+        value_type = str(value.get("type", "")).lower()
+        if value_type in ("url", "formula", "mention", "multiplevalue"):
+            return value, f"supported_{value_type}"
+
+    for item in _extract_file_items(value):
+        name = item.get("name", "") or "video"
+        url = item.get("url", "")
+        if not url and item.get("token"):
+            url = _sheet_file_url(item["token"], spreadsheet_url_or_token)
+        if _is_http_url(url):
+            parsed_name = os.path.basename(urllib.parse.urlparse(url).path)
+            return {
+                "type": "url",
+                "text": _safe_filename(name, parsed_name or "video"),
+                "link": url,
+            }, "file_as_url"
+
+    return _cell_value_to_text(value), "json_text"
 
 
 def _write_temp_video(video_bytes: bytes, file_name: str, file_token: str) -> str:
@@ -1506,15 +1530,31 @@ class FeishuValueToSheetCell:
 
         if mode == "raw" or (mode == "auto" and cell_value_json):
             raw_value = _json_loads_cell_value(cell_value_json)
-            write_result = api.write_values(access_token, spreadsheet_token, cell_range, [[raw_value]], "overwrite")
+            raw_error = ""
+            raw_fallback = False
+            raw_fallback_reason = ""
+            try:
+                write_result = api.write_values(access_token, spreadsheet_token, cell_range, [[raw_value]], "overwrite")
+                write_value = raw_value
+            except FeishuAPIError as exc:
+                raw_error = str(exc)
+                write_value, raw_fallback_reason = _raw_cell_to_supported_value(raw_value, spreadsheet_url_or_token)
+                if write_value == raw_value:
+                    raise
+                raw_fallback = True
+                write_result = api.write_values(access_token, spreadsheet_token, cell_range, [[write_value]], "overwrite")
             status = {
                 "ok": True,
                 "version": NODE_VERSION,
-                "write_type": "raw_cell",
+                "write_type": "raw_cell_fallback" if raw_fallback else "raw_cell",
                 "range": cell_range,
                 "row": int(row),
                 "column": _column_to_letter(column),
                 "raw_cell": raw_value,
+                "written_cell": write_value,
+                "raw_fallback": raw_fallback,
+                "raw_fallback_reason": raw_fallback_reason,
+                "raw_error": raw_error,
                 "feishu_response": write_result,
             }
             return (_json_dumps(status),)
@@ -1861,6 +1901,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FeishuSheetReader": "Feishu Sheet Reader v1.1.3",
-    "FeishuSheetWriter": "Feishu Sheet Writer v1.1.3",
+    "FeishuSheetReader": "Feishu Sheet Reader v1.1.4",
+    "FeishuSheetWriter": "Feishu Sheet Writer v1.1.4",
 }
