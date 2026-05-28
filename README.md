@@ -3,8 +3,8 @@
 用于在 ComfyUI 中读取和写入飞书普通电子表格（Sheet）的自定义节点。
 安装后在 `Feishu` 分类下只会出现两个正式节点：
 
-- `Feishu Sheet Reader v1.1.0`
-- `Feishu Sheet Writer v1.1.0`
+- `Feishu Sheet Reader v1.1.1`
+- `Feishu Sheet Writer v1.1.1`
 
 ## 安装
 
@@ -91,9 +91,10 @@ $env:FEISHU_APP_SECRET="xxx"
 - `text`：要写入的文本。
 - `image`：要写入的 ComfyUI `IMAGE`。
 - `image_name`：写入飞书时使用的图片名称。
+- `video`：可选，直接连接 ComfyUI 视频/资源类输出；节点会尝试从常见字段里解析本地路径或 URL。
 - `video_path_or_url`：视频 URL 或本地视频文件路径。
 - `video_name`：写入飞书时使用的视频名称。
-- `drive_folder_token`：本地视频上传到飞书云空间时使用的目标文件夹 token。
+- `drive_folder_token`：本地视频上传到飞书云空间时使用的目标文件夹 token 或文件夹链接；留空时尝试上传到云空间根目录。
 
 `auto` 模式优先级：
 
@@ -105,6 +106,9 @@ $env:FEISHU_APP_SECRET="xxx"
 
 - `video_path_or_url` 是 `http://` 或 `https://` 时，会写成 Sheet 富文本 URL 对象。
 - `video_path_or_url` 是本地文件路径时，会先上传到飞书云空间，再把云空间文件引用写入单元格。
+- 从另一个 Sheet 搬视频时，可以把 Reader 的 `video_path_or_url` 直接接到 Writer 的 `video_path_or_url`。
+- 从 ComfyUI 生成视频写回 Sheet 时，优先把生成视频节点的输出接到 Writer 的 `video`；如果它输出的是字符串路径，也可以接到 `video_path_or_url`。
+- `drive_folder_token` 建议填一个你能访问的飞书云空间文件夹 token 或文件夹链接；留空会尝试上传到云空间根目录，但有些租户/应用权限下根目录文件不一定方便找到。
 - 直接上传本地视频目前限制为 20 MB；更大的视频建议先上传到飞书云空间，或者传入一个公开视频/飞书文件 URL。
 
 ## 注意

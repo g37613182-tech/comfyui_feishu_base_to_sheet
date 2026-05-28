@@ -15,9 +15,17 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
 
-NODE_VERSION = "1.1.0"
+NODE_VERSION = "1.1.1"
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".mpeg", ".mpg", ".3gp"}
 MAX_DIRECT_DRIVE_UPLOAD_BYTES = 20 * 1024 * 1024
+
+
+class AnyType(str):
+    def __ne__(self, value: object) -> bool:
+        return False
+
+
+ANY_TYPE = AnyType("*")
 
 
 class FeishuAPIError(RuntimeError):
@@ -62,6 +70,152 @@ def _safe_filename(name: str, default: str) -> str:
     name = os.path.basename(name.replace("\\", "/"))
     name = re.sub(r"[^\w.\- ()\u4e00-\u9fff]+", "_", name).strip(" ._")
     return name or default
+
+
+def _extract_drive_folder_token(value: str) -> str:
+    value = _clean_text_input(value)
+    if not value:
+        return ""
+    if "://" not in value:
+        return value
+
+    parsed = urllib.parse.urlparse(value)
+    query = urllib.parse.parse_qs(parsed.query)
+    for key in ("folder_token", "folderToken", "parent_node", "parentNode"):
+        item = query.get(key, [""])[0]
+        if item:
+            return item
+
+    path = parsed.path or ""
+    for pattern in (r"/drive/folder/([^/?#]+)", r"/folder/([^/?#]+)", r"/folders/([^/?#]+)"):
+        match = re.search(pattern, path)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _comfy_managed_file_path(filename: str, subfolder: str = "", file_type: str = "output") -> str:
+    filename = _clean_text_input(filename)
+    if not filename:
+        return ""
+    try:
+        import folder_paths
+    except Exception:
+        return ""
+
+    file_type = _clean_text_input(file_type).lower()
+    if file_type == "input":
+        base_dir = folder_paths.get_input_directory()
+    elif file_type == "temp":
+        base_dir = folder_paths.get_temp_directory()
+    else:
+        base_dir = folder_paths.get_output_directory()
+
+    candidate = os.path.abspath(os.path.join(base_dir, _clean_text_input(subfolder), filename))
+    base_abs = os.path.abspath(base_dir)
+    try:
+        common = os.path.commonpath([base_abs, candidate])
+    except ValueError:
+        return ""
+    if common != base_abs:
+        return ""
+    return candidate
+
+
+def _extract_video_path_or_url(value: Any) -> str:
+    seen: set = set()
+    candidate_keys = (
+        "video_path_or_url",
+        "video_path",
+        "file_path",
+        "filepath",
+        "full_path",
+        "resource_path",
+        "path",
+        "url",
+        "link",
+    )
+
+    def from_string(raw: str) -> str:
+        raw = _clean_text_input(raw)
+        if not raw:
+            return ""
+        if _is_http_url(raw) or os.path.isfile(raw):
+            return raw
+        if raw.strip().startswith(("{", "[")):
+            try:
+                return walk(json.loads(raw))
+            except json.JSONDecodeError:
+                return ""
+        match = re.search(r"https?://[^\s\"'<>，。]+", raw)
+        if match:
+            return match.group(0)
+        suffix = os.path.splitext(raw)[1].lower()
+        if suffix in VIDEO_EXTENSIONS and (os.path.isabs(raw) or "/" in raw or "\\" in raw):
+            return raw
+        return ""
+
+    def walk(item: Any) -> str:
+        marker = id(item)
+        if marker in seen:
+            return ""
+        seen.add(marker)
+
+        if item is None:
+            return ""
+        if isinstance(item, str):
+            return from_string(item)
+        if isinstance(item, os.PathLike):
+            return from_string(os.fspath(item))
+        if isinstance(item, dict):
+            for key in candidate_keys:
+                result = from_string(str(item.get(key, ""))) if item.get(key) is not None else ""
+                if result:
+                    return result
+            filename = item.get("filename") or item.get("file_name") or item.get("name")
+            if filename:
+                managed = _comfy_managed_file_path(
+                    str(filename),
+                    str(item.get("subfolder", "")),
+                    str(item.get("type", "output")),
+                )
+                if managed:
+                    return managed
+            for nested in item.values():
+                result = walk(nested)
+                if result:
+                    return result
+            return ""
+        if isinstance(item, (list, tuple)):
+            for nested in item:
+                result = walk(nested)
+                if result:
+                    return result
+            return ""
+
+        for key in candidate_keys:
+            if hasattr(item, key):
+                direct = getattr(item, key, "")
+                result = walk(direct)
+                if result:
+                    return result
+        data = {
+            "filename": getattr(item, "filename", ""),
+            "file_name": getattr(item, "file_name", ""),
+            "name": getattr(item, "name", ""),
+            "subfolder": getattr(item, "subfolder", ""),
+            "type": getattr(item, "type", "output"),
+        }
+        managed = _comfy_managed_file_path(
+            str(data.get("filename") or data.get("file_name") or data.get("name") or ""),
+            str(data.get("subfolder") or ""),
+            str(data.get("type") or "output"),
+        )
+        if managed:
+            return managed
+        return ""
+
+    return walk(value)
 
 
 def _extract_token(value: str, patterns: Sequence[str]) -> str:
@@ -953,9 +1107,7 @@ class FeishuOpenAPI:
                 f"Direct video upload is limited to {max_mb} MB for now. "
                 "Use a video URL or upload the file to Feishu Drive first."
             )
-        folder_token = _clean_text_input(folder_token)
-        if not folder_token:
-            raise ValueError("drive_folder_token is required when writing a local video file")
+        folder_token = _extract_drive_folder_token(folder_token)
         payload = self.request_multipart(
             "/open-apis/drive/v1/files/upload_all",
             token,
@@ -1262,6 +1414,7 @@ class FeishuValueToSheetCell:
             "optional": {
                 "text": ("STRING", {"default": "", "multiline": True}),
                 "image": ("IMAGE",),
+                "video": (ANY_TYPE,),
                 "video_path_or_url": ("STRING", {"default": ""}),
                 "drive_folder_token": ("STRING", {"default": ""}),
                 "openapi_domain": ("STRING", {"default": "https://open.feishu.cn"}),
@@ -1292,6 +1445,7 @@ class FeishuValueToSheetCell:
         timeout_seconds: int,
         text: str = "",
         image: Any = None,
+        video: Any = None,
         video_path_or_url: str = "",
         drive_folder_token: str = "",
         openapi_domain: str = "https://open.feishu.cn",
@@ -1303,7 +1457,10 @@ class FeishuValueToSheetCell:
         cell = _cell_from_row_column(row, column)
         image_name = _clean_text_input(image_name) or "image.png"
         video_path_or_url = _clean_text_input(video_path_or_url)
-        drive_folder_token = _clean_text_input(drive_folder_token)
+        extracted_video_path_or_url = _extract_video_path_or_url(video)
+        if not video_path_or_url and extracted_video_path_or_url:
+            video_path_or_url = extracted_video_path_or_url
+        drive_folder_token = _extract_drive_folder_token(drive_folder_token)
         text = "" if text is None else str(text)
         openapi_domain = _clean_text_input(openapi_domain) or "https://open.feishu.cn"
         if not app_id or not app_secret:
@@ -1320,9 +1477,9 @@ class FeishuValueToSheetCell:
         access_token = api.tenant_access_token(app_id, app_secret)
         cell_range = _make_range(sheet_id, cell, 1, 1)
 
-        if mode == "video" or (mode == "auto" and video_path_or_url):
+        if mode == "video" or (mode == "auto" and (video_path_or_url or video is not None)):
             if not video_path_or_url:
-                raise ValueError("mode=video requires video_path_or_url")
+                raise ValueError("mode=video requires video_path_or_url or a video input containing a path/URL")
             inferred_name = os.path.basename(urllib.parse.urlparse(video_path_or_url).path) or "video.mp4"
             requested_video_name = _clean_text_input(video_name)
             if not requested_video_name or requested_video_name == "video.mp4":
@@ -1344,6 +1501,7 @@ class FeishuValueToSheetCell:
                     "column": _column_to_letter(column),
                     "video_name": safe_video_name,
                     "video_path_or_url": video_path_or_url,
+                    "video_input_detected": bool(video is not None),
                     "feishu_response": write_result,
                 }
                 return (_json_dumps(status),)
@@ -1386,8 +1544,11 @@ class FeishuValueToSheetCell:
                 "column": _column_to_letter(column),
                 "video_name": safe_video_name,
                 "video_path_or_url": video_path_or_url,
+                "video_input_detected": bool(video is not None),
                 "file_token": file_token,
                 "drive_url": _sheet_file_url(file_token, spreadsheet_url_or_token),
+                "drive_parent_node": drive_folder_token,
+                "drive_parent_note": "empty means Feishu Drive root",
                 "upload": upload_result,
                 "feishu_response": write_result,
             }
@@ -1657,6 +1818,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FeishuSheetReader": "Feishu Sheet Reader v1.1.0",
-    "FeishuSheetWriter": "Feishu Sheet Writer v1.1.0",
+    "FeishuSheetReader": "Feishu Sheet Reader v1.1.1",
+    "FeishuSheetWriter": "Feishu Sheet Writer v1.1.1",
 }
