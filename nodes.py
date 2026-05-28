@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
 
-NODE_VERSION = "1.1.2"
+NODE_VERSION = "1.1.3"
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".mpeg", ".mpg", ".3gp"}
 MAX_DIRECT_DRIVE_UPLOAD_BYTES = 20 * 1024 * 1024
 
@@ -34,6 +34,16 @@ class FeishuAPIError(RuntimeError):
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _json_loads_cell_value(raw: str) -> Any:
+    raw = _clean_text_input(raw)
+    if not raw:
+        raise ValueError("cell_value_json is empty")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"cell_value_json must be valid JSON: {exc}") from exc
 
 
 def _read_secret(value: str, env_name: str) -> str:
@@ -1420,12 +1430,13 @@ class FeishuValueToSheetCell:
                 "sheet_id": ("STRING", {"default": ""}),
                 "row": ("INT", {"default": 1, "min": 1, "max": 1000000, "step": 1}),
                 "column": ("STRING", {"default": "A"}),
-                "mode": (["auto", "text", "image", "video"], {"default": "auto"}),
+                "mode": (["auto", "text", "image", "video", "raw"], {"default": "auto"}),
                 "image_name": ("STRING", {"default": "image.png"}),
                 "video_name": ("STRING", {"default": "video.mp4"}),
                 "timeout_seconds": ("INT", {"default": 30, "min": 5, "max": 300, "step": 1}),
             },
             "optional": {
+                "cell_value_json": ("STRING", {"default": "", "multiline": True}),
                 "text": ("STRING", {"default": "", "multiline": True}),
                 "image": ("IMAGE",),
                 "video": (ANY_TYPE,),
@@ -1457,6 +1468,7 @@ class FeishuValueToSheetCell:
         image_name: str,
         video_name: str,
         timeout_seconds: int,
+        cell_value_json: str = "",
         text: str = "",
         image: Any = None,
         video: Any = None,
@@ -1470,6 +1482,7 @@ class FeishuValueToSheetCell:
         sheet_id = _clean_text_input(sheet_id)
         cell = _cell_from_row_column(row, column)
         image_name = _clean_text_input(image_name) or "image.png"
+        cell_value_json = _clean_text_input(cell_value_json)
         video_path_or_url = _clean_text_input(video_path_or_url)
         extracted_video_path_or_url = _extract_video_path_or_url(video)
         if not video_path_or_url and extracted_video_path_or_url:
@@ -1490,6 +1503,21 @@ class FeishuValueToSheetCell:
         api = FeishuOpenAPI(openapi_domain, timeout_seconds)
         access_token = api.tenant_access_token(app_id, app_secret)
         cell_range = _make_range(sheet_id, cell, 1, 1)
+
+        if mode == "raw" or (mode == "auto" and cell_value_json):
+            raw_value = _json_loads_cell_value(cell_value_json)
+            write_result = api.write_values(access_token, spreadsheet_token, cell_range, [[raw_value]], "overwrite")
+            status = {
+                "ok": True,
+                "version": NODE_VERSION,
+                "write_type": "raw_cell",
+                "range": cell_range,
+                "row": int(row),
+                "column": _column_to_letter(column),
+                "raw_cell": raw_value,
+                "feishu_response": write_result,
+            }
+            return (_json_dumps(status),)
 
         if mode == "video" or (mode == "auto" and (video_path_or_url or video is not None)):
             if not video_path_or_url:
@@ -1620,8 +1648,8 @@ class FeishuSheetCellReader:
             },
         }
 
-    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "BOOLEAN", "STRING", "BOOLEAN")
-    RETURN_NAMES = ("text", "image", "status_json", "has_image", "video_path_or_url", "has_video")
+    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "BOOLEAN", "STRING", "BOOLEAN", "STRING")
+    RETURN_NAMES = ("text", "image", "status_json", "has_image", "video_path_or_url", "has_video", "cell_value_json")
     FUNCTION = "read_cell"
     CATEGORY = "Feishu"
     OUTPUT_NODE = True
@@ -1642,7 +1670,7 @@ class FeishuSheetCellReader:
         date_time_render_option: str,
         timeout_seconds: int,
         openapi_domain: str = "https://open.feishu.cn",
-    ) -> Tuple[str, Any, str, bool, str, bool]:
+    ) -> Tuple[str, Any, str, bool, str, bool, str]:
         app_id = _read_secret(app_id, "FEISHU_APP_ID")
         app_secret = _read_secret(app_secret, "FEISHU_APP_SECRET")
         spreadsheet_url_or_token = _clean_text_input(spreadsheet_url_or_token)
@@ -1667,6 +1695,7 @@ class FeishuSheetCellReader:
         values = data.get("valueRange", {}).get("values", [[]])
         value = values[0][0] if values and values[0] else ""
         text = _cell_value_to_text(value)
+        cell_value_json = _json_dumps(value)
 
         file_items = _extract_file_items(value) if read_mode in ("auto", "video") else []
         video_items = [item for item in file_items if _looks_like_video_item(item)]
@@ -1699,7 +1728,7 @@ class FeishuSheetCellReader:
                 "video_lookup_error": video_lookup_error,
                 "raw_cell": value,
             }
-            return text, _blank_comfy_image(), _json_dumps(status), False, video_output, bool(video_output)
+            return text, _blank_comfy_image(), _json_dumps(status), False, video_output, bool(video_output), cell_value_json
 
         if read_mode == "video":
             status = {
@@ -1712,7 +1741,7 @@ class FeishuSheetCellReader:
                 "raw_cell": value,
                 "file_items": file_items,
             }
-            return text, _blank_comfy_image(), _json_dumps(status), False, "", False
+            return text, _blank_comfy_image(), _json_dumps(status), False, "", False, cell_value_json
 
         image_like_value = _looks_like_sheet_image_value(value)
         file_tokens = _extract_file_tokens(value) if read_mode in ("auto", "image") else []
@@ -1752,7 +1781,7 @@ class FeishuSheetCellReader:
                     "image_bytes": len(image_bytes),
                     "raw_cell": value,
                 }
-                return text, image, _json_dumps(status), True, "", False
+                return text, image, _json_dumps(status), True, "", False, cell_value_json
 
         should_try_xlsx = read_mode == "image" or (read_mode == "auto" and image_like_value)
         if should_try_xlsx:
@@ -1787,7 +1816,7 @@ class FeishuSheetCellReader:
                     "xlsx": xlsx_details,
                     "sheet": sheet_info,
                 }
-                return text, image, _json_dumps(status), True, "", False
+                return text, image, _json_dumps(status), True, "", False, cell_value_json
             status = {
                 "ok": False,
                 "version": NODE_VERSION,
@@ -1802,7 +1831,7 @@ class FeishuSheetCellReader:
                 "xlsx": xlsx_details,
                 "sheet": sheet_info,
             }
-            return text, _blank_comfy_image(), _json_dumps(status), False, "", False
+            return text, _blank_comfy_image(), _json_dumps(status), False, "", False, cell_value_json
 
         status = {
             "ok": True,
@@ -1815,7 +1844,7 @@ class FeishuSheetCellReader:
             "image_lookup_error": image_lookup_error,
             "raw_cell": value,
         }
-        return text, _blank_comfy_image(), _json_dumps(status), False, "", False
+        return text, _blank_comfy_image(), _json_dumps(status), False, "", False, cell_value_json
 
 
 class FeishuSheetWriter(FeishuValueToSheetCell):
@@ -1832,6 +1861,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FeishuSheetReader": "Feishu Sheet Reader v1.1.2",
-    "FeishuSheetWriter": "Feishu Sheet Writer v1.1.2",
+    "FeishuSheetReader": "Feishu Sheet Reader v1.1.3",
+    "FeishuSheetWriter": "Feishu Sheet Writer v1.1.3",
 }

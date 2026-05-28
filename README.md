@@ -3,8 +3,8 @@
 用于在 ComfyUI 中读取和写入飞书普通电子表格（Sheet）的自定义节点。
 安装后在 `Feishu` 分类下只会出现两个正式节点：
 
-- `Feishu Sheet Reader v1.1.2`
-- `Feishu Sheet Writer v1.1.2`
+- `Feishu Sheet Reader v1.1.3`
+- `Feishu Sheet Writer v1.1.3`
 
 ## 安装
 
@@ -62,6 +62,7 @@ $env:FEISHU_APP_SECRET="xxx"
 - `has_image`：是否成功读到真实图片。
 - `video_path_or_url`：视频 URL，或下载到本机临时目录后的视频路径。
 - `has_video`：是否成功识别到视频链接或文件引用。
+- `cell_value_json`：原始单元格值 JSON；搬运 Sheet 原生附件时优先把它接到 Writer 的 `cell_value_json`。
 
 图片读取逻辑：
 
@@ -87,7 +88,8 @@ $env:FEISHU_APP_SECRET="xxx"
 - `sheet_id`：工作表 ID；如果 URL 带 `?sheet=xxxx`，可以留空。
 - `row`：行号，从 1 开始。
 - `column`：列号，支持 `C` 或 `3`。
-- `mode`：`auto` / `text` / `image` / `video`。
+- `mode`：`auto` / `text` / `image` / `video` / `raw`。
+- `cell_value_json`：原始单元格值 JSON；用于把 Reader 读到的 Sheet 原生附件结构原样写回。
 - `text`：要写入的文本。
 - `image`：要写入的 ComfyUI `IMAGE`。
 - `image_name`：写入飞书时使用的图片名称。
@@ -98,15 +100,17 @@ $env:FEISHU_APP_SECRET="xxx"
 
 `auto` 模式优先级：
 
-1. 如果填写了 `video_path_or_url`，写视频链接或视频文件引用。
-2. 如果连接了 `image` 输入，写图片。
-3. 否则写 `text`。
+1. 如果填写了 `cell_value_json`，原样写入原始单元格值。
+2. 如果填写了 `video_path_or_url`，写视频链接或视频文件引用。
+3. 如果连接了 `image` 输入，写图片。
+4. 否则写 `text`。
 
 视频写入逻辑：
 
 - `video_path_or_url` 是 `http://` 或 `https://` 时，会写成 Sheet 富文本 URL 对象。
 - `video_path_or_url` 是本地文件路径时，会先上传到飞书云空间，再把云空间文件的可点击链接写入单元格。
-- 从另一个 Sheet 搬视频时，可以把 Reader 的 `video_path_or_url` 直接接到 Writer 的 `video_path_or_url`。
+- 从另一个 Sheet 搬视频附件时，优先把 Reader 的 `cell_value_json` 接到 Writer 的 `cell_value_json`，`mode=auto` 或 `raw`；这条路最有机会保留飞书原生附件胶囊。
+- 如果只需要搬普通视频链接，可以把 Reader 的 `video_path_or_url` 直接接到 Writer 的 `video_path_or_url`。
 - 从 ComfyUI 生成视频写回 Sheet 时，优先把生成视频节点的输出接到 Writer 的 `video`；如果它输出的是字符串路径，也可以接到 `video_path_or_url`。
 - `drive_folder_token` 建议填一个你能访问的飞书云空间文件夹 token 或文件夹链接；留空会尝试上传到云空间根目录，但有些租户/应用权限下根目录文件不一定方便找到。
 - 直接上传本地视频目前限制为 20 MB；更大的视频建议先上传到飞书云空间，或者传入一个公开视频/飞书文件 URL。
